@@ -19,7 +19,7 @@ os.environ["DRIVE_ROOT"] = str(TEST_TMP_DIR)
 from app.config import settings  # noqa: E402
 from app.core.model_manager import ModelType, model_manager  # noqa: E402
 from app.core.storage import storage  # noqa: E402
-from app.main import app  # noqa: E402
+from app.main import app, is_request_authorized  # noqa: E402
 from app.routers.generation import (  # noqa: E402
     _enforce_reference_mix_muted,
     _resolve_job_seed,
@@ -28,7 +28,7 @@ from app.routers.generation import (  # noqa: E402
 )
 from app.routers.projects import merge_track_mixer_updates  # noqa: E402
 from app.schemas import ProducerSpecSchema, ProjectSchema, TrackSchema  # noqa: E402
-from app.services.acestep_service import _synthesize_musical_mix  # noqa: E402
+from app.services.acestep_service import _invoke_acestep_real_sync, _synthesize_musical_mix  # noqa: E402
 from app.services.beat_service import analyze_beat_grid  # noqa: E402
 from app.services.demucs_service import _mock_separate_stems  # noqa: E402
 from app.services.dsp_service import export_project_audio, process_track_dsp  # noqa: E402
@@ -520,6 +520,161 @@ class BackendPipelineTest(unittest.TestCase):
         exported_peak = float(np.max(np.abs(exported_audio)))
         self.assertLess(exported_peak, 0.18)
         self.assertGreater(exported_peak, 0.09)
+
+    def test_06_float32_wav_headroom_auth_and_acestep_v15_adapter(self) -> None:
+        from dataclasses import dataclass
+        from scipy.io import wavfile
+
+        sr = 44100
+        # 1. Lossless 32-bit float WAV preserves super-unity peaks (>1.0) without 16-bit clipping
+        proj = storage.create_project("Float32 Auth & 1.5 Adapter", bpm=122.0, musical_key="F minor")
+        n = sr // 4
+        t = np.linspace(0.0, 0.25, n, endpoint=False, dtype=np.float32)
+        orig = np.stack(
+            [1.35 * np.sin(2.0 * np.pi * 220.0 * t), -1.20 * np.cos(2.0 * np.pi * 330.0 * t)],
+            axis=1,
+        ).astype(np.float32)
+        storage.write_wav(proj.project_id, "raw/headroom_test.wav", orig, sample_rate=sr)
+        read_back, read_sr = storage.read_wav(proj.project_id, "raw/headroom_test.wav", target_sr=sr)
+        self.assertEqual(read_sr, sr)
+        self.assertLess(float(np.max(np.abs(read_back - orig))), 1e-6)
+        self.assertGreater(float(np.max(read_back)), 1.30)
+        self.assertLess(float(np.min(read_back)), -1.15)
+
+        # 2. LYRION_API_TOKEN auth & CORS preflight exemptions
+        self.assertTrue(is_request_authorized("GET", "/api/v1/health", {}, {}, expected_token=""))
+        self.assertTrue(is_request_authorized("OPTIONS", "/api/v1/projects", {}, {}, expected_token="sec_123"))
+        self.assertTrue(is_request_authorized("GET", "/", {}, {}, expected_token="sec_123"))
+        self.assertFalse(is_request_authorized("GET", "/api/v1/projects", {}, {}, expected_token="sec_123"))
+        self.assertFalse(
+            is_request_authorized(
+                "GET",
+                "/api/v1/projects",
+                {"Authorization": "Bearer wrong_tok"},
+                {},
+                expected_token="sec_123",
+            )
+        )
+        self.assertTrue(
+            is_request_authorized(
+                "GET",
+                "/api/v1/projects",
+                {"Authorization": "Bearer sec_123"},
+                {},
+                expected_token="sec_123",
+            )
+        )
+        self.assertTrue(
+            is_request_authorized(
+                "GET",
+                "/api/v1/projects/p1/audio/stems/drums.wav",
+                {},
+                {"token": "sec_123"},
+                expected_token="sec_123",
+            )
+        )
+
+        # 3. ACE-Step 1.5 adapter handles text2music and repaint with llm_handler=None
+        captured_calls: list[dict[str, object]] = []
+
+        @dataclass
+        class FakeParams:
+            task_type: str
+            caption: str
+            lyrics: str
+            bpm: int
+            keyscale: str
+            duration: float
+            seed: int
+            inference_steps: int
+            guidance_scale: float
+            thinking: bool = False
+            src_audio: str | None = None
+            repainting_start: float = 0.0
+            repainting_end: float = 0.0
+
+        @dataclass
+        class FakeConfig:
+            batch_size: int = 1
+            audio_format: str = "wav"
+
+        @dataclass
+        class FakeResult:
+            success: bool
+            audios: list[dict[str, str]]
+            error: str | None = None
+
+        def fake_generate_music(dit_handler, llm_handler, params, config, save_dir):
+            self.assertIsNone(llm_handler)
+            self.assertIsNotNone(dit_handler)
+            self.assertFalse(params.thinking)
+            captured_calls.append(
+                {
+                    "task_type": params.task_type,
+                    "bpm": params.bpm,
+                    "keyscale": params.keyscale,
+                    "src_exists": bool(params.src_audio and Path(params.src_audio).is_file()),
+                    "repainting_start": params.repainting_start,
+                    "repainting_end": params.repainting_end,
+                }
+            )
+            out_wav = Path(save_dir) / f"{params.task_type}_{params.seed}.wav"
+            fake_audio = np.stack(
+                [0.25 * np.sin(2.0 * np.pi * 440.0 * t), 0.25 * np.sin(2.0 * np.pi * 440.0 * t)],
+                axis=1,
+            ).astype(np.float32)
+            wavfile.write(str(out_wav), sr, fake_audio)
+            return FakeResult(success=True, audios=[{"path": str(out_wav)}])
+
+        fake_bundle = {
+            "version": "1.5",
+            "dit_handler": object(),
+            "generate_music": fake_generate_music,
+            "GenerationParams": FakeParams,
+            "GenerationConfig": FakeConfig,
+        }
+
+        gen_audio = _invoke_acestep_real_sync(
+            fake_bundle,
+            task_type="text2music",
+            prompt="melodic house, 122 bpm, F minor",
+            lyrics="[Verse]\nTest",
+            bpm=122.0,
+            musical_key="F minor",
+            duration_sec=0.25,
+            seed=101,
+            inference_steps=20,
+            guidance_scale=7.0,
+            target_sr=sr,
+            total_samples=n,
+        )
+        self.assertEqual(gen_audio.shape, (n, 2))
+        self.assertEqual(gen_audio.dtype, np.float32)
+
+        rep_audio = _invoke_acestep_real_sync(
+            fake_bundle,
+            task_type="repaint",
+            prompt="acid synth, 122 bpm, F minor",
+            lyrics="[Solo]",
+            bpm=122.0,
+            musical_key="F minor",
+            duration_sec=0.25,
+            seed=202,
+            inference_steps=20,
+            guidance_scale=7.0,
+            target_sr=sr,
+            total_samples=n,
+            src_audio=orig,
+            repaint_start_sec=0.05,
+            repaint_end_sec=0.20,
+        )
+        self.assertEqual(rep_audio.shape, (n, 2))
+        self.assertEqual(captured_calls[0]["task_type"], "text2music")
+        self.assertFalse(captured_calls[0]["src_exists"])
+        self.assertEqual(captured_calls[1]["task_type"], "repaint")
+        self.assertTrue(captured_calls[1]["src_exists"])
+        self.assertAlmostEqual(float(captured_calls[1]["repainting_start"]), 0.05, places=4)
+        self.assertAlmostEqual(float(captured_calls[1]["repainting_end"]), 0.20, places=4)
 
 
 if __name__ == "__main__":

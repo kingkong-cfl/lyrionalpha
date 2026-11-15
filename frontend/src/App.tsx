@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircle, CheckCircle2, Disc3, Layers, PlusCircle } from "lucide-react";
 import {
+  buildDownloadAudioUrl,
   createProject,
   enhanceWithProducer,
   fetchHealth,
   getProject,
+  getSavedApiToken,
   getSavedServerUrl,
   listProjects,
   pollJobUntilDone,
   saveProject,
+  setSavedApiToken,
   setSavedServerUrl,
   triggerAddInstrumentLayer,
   triggerExportProject,
@@ -73,6 +76,7 @@ function normalizeReferenceMixMute(
 
 export function App() {
   const [serverUrl, setServerUrl] = useState<string>(() => getSavedServerUrl());
+  const [apiToken, setApiToken] = useState<string>(() => getSavedApiToken());
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -97,11 +101,28 @@ export function App() {
 
   const rafRef = useRef<number | null>(null);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
+  const playheadRef = useRef<HTMLDivElement | null>(null);
+  const rulerPlayheadRef = useRef<HTMLDivElement | null>(null);
+  const currentTimeRef = useRef<number>(0);
+  const effectivePxPerSecRef = useRef<number>(85);
+  const lastClockCommitMsRef = useRef<number>(0);
   const latestTracksRef = useRef<TrackSchema[]>([]);
   const selectionRef = useRef<RegionSelection | null>(null);
 
   latestTracksRef.current = activeProject?.tracks ?? [];
   selectionRef.current = selection;
+
+  const updatePlayheadPosition = useCallback((sec: number) => {
+    currentTimeRef.current = sec;
+    const x = Math.max(0, sec * effectivePxPerSecRef.current);
+    const transform = `translate3d(${x}px, 0, 0)`;
+    if (playheadRef.current) {
+      playheadRef.current.style.transform = transform;
+    }
+    if (rulerPlayheadRef.current) {
+      rulerPlayheadRef.current.style.transform = transform;
+    }
+  }, []);
 
   const showToast = useCallback((kind: "info" | "error", text: string) => {
     setStatusToast({ kind, text });
@@ -162,7 +183,7 @@ export function App() {
       }
     }, 8000);
     return () => window.clearInterval(id);
-  }, [serverUrl, refreshHealthAndProjects]);
+  }, [serverUrl, apiToken, refreshHealthAndProjects]);
 
   // Preload Tone.js multi-track buffers whenever project or track revisions change
   const trackSignature = activeProject
@@ -175,6 +196,7 @@ export function App() {
     if (!activeProject || activeProject.tracks.length === 0) {
       audioEngine.disposeAll();
       setIsPlaying(false);
+      updatePlayheadPosition(0);
       setCurrentTimeSec(0);
       return;
     }
@@ -199,9 +221,9 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [trackSignature, serverUrl]);
+  }, [trackSignature, serverUrl, apiToken, updatePlayheadPosition]);
 
-  // High-precision rAF playhead clock synced to Tone.Transport
+  // High-precision 60fps DOM playhead (zero React re-renders) + 10Hz throttled LCD clock
   useEffect(() => {
     const tick = () => {
       const t = audioEngine.getCurrentTimeSec();
@@ -209,14 +231,22 @@ export function App() {
       if (duration > 0 && t >= duration && audioEngine.getTransportState() === "started") {
         audioEngine.stop();
         setIsPlaying(false);
+        updatePlayheadPosition(0);
+        lastClockCommitMsRef.current = performance.now();
         setCurrentTimeSec(0);
       } else {
-        setCurrentTimeSec(t);
+        updatePlayheadPosition(t);
+        const now = performance.now();
+        if (now - lastClockCommitMsRef.current >= 100) {
+          lastClockCommitMsRef.current = now;
+          setCurrentTimeSec(t);
+        }
       }
       rafRef.current = window.requestAnimationFrame(tick);
     };
 
     if (isPlaying) {
+      lastClockCommitMsRef.current = performance.now();
       rafRef.current = window.requestAnimationFrame(tick);
     }
     return () => {
@@ -224,7 +254,7 @@ export function App() {
         window.cancelAnimationFrame(rafRef.current);
       }
     };
-  }, [isPlaying, activeProject?.grid.duration_sec]);
+  }, [isPlaying, activeProject?.grid.duration_sec, updatePlayheadPosition]);
 
   // Update Tone.Transport loop when selection or loopEnabled toggles
   useEffect(() => {
@@ -258,10 +288,16 @@ export function App() {
     setServerUrl(cleaned);
   };
 
+  const handleUpdateApiToken = (nextToken: string) => {
+    const cleaned = setSavedApiToken(nextToken);
+    setApiToken(cleaned);
+  };
+
   const handleSelectProject = async (projectId: string) => {
     if (!projectId) return;
     audioEngine.stop();
     setIsPlaying(false);
+    updatePlayheadPosition(0);
     setCurrentTimeSec(0);
     handleSelectRegion(null);
     setDspTrackId(null);
@@ -445,9 +481,7 @@ export function App() {
       const done = await pollJobUntilDone(serverUrl, jobCreated.job_id, setActiveJob);
       const rel = done.result?.download_rel_path as string | undefined;
       if (rel) {
-        const downloadUrl = `${serverUrl.replace(/\/+$/, "")}/api/v1/projects/${encodeURIComponent(
-          activeProject.project_id
-        )}/audio/${rel}`;
+        const downloadUrl = buildDownloadAudioUrl(serverUrl, activeProject.project_id, rel);
         const link = document.createElement("a");
         link.href = downloadUrl;
         link.download = rel.split("/").pop() || "export.wav";
@@ -468,15 +502,27 @@ export function App() {
     }
   };
 
-  const handleUpdateTrack = (trackId: string, patch: Partial<TrackSchema>) => {
-    if (!activeProject) return;
-    const nextTracks = activeProject.tracks.map((t) =>
-      t.track_id === trackId ? { ...t, ...patch } : t
-    );
-    const updated = { ...activeProject, tracks: nextTracks };
-    setActiveProject(updated);
-    audioEngine.syncMixerParams(nextTracks);
-  };
+  const handleExportRef = useRef(handleExport);
+  handleExportRef.current = handleExport;
+
+  const handleUpdateTrack = useCallback((trackId: string, patch: Partial<TrackSchema>) => {
+    setActiveProject((prev) => {
+      if (!prev) return prev;
+      const nextTracks = prev.tracks.map((t) =>
+        t.track_id === trackId ? { ...t, ...patch } : t
+      );
+      audioEngine.syncMixerParams(nextTracks);
+      return { ...prev, tracks: nextTracks };
+    });
+  }, []);
+
+  const handleToggleDspTrack = useCallback((id: string) => {
+    setDspTrackId((prev) => (prev === id ? null : id));
+  }, []);
+
+  const handleExportTrack = useCallback((id: string) => {
+    handleExportRef.current("single_track_wav", id);
+  }, []);
 
   const handleSaveMixToDrive = async () => {
     if (!activeProject) return;
@@ -508,13 +554,18 @@ export function App() {
   const handleStop = () => {
     audioEngine.stop();
     setIsPlaying(false);
+    updatePlayheadPosition(0);
     setCurrentTimeSec(0);
   };
 
-  const handleSeek = (sec: number) => {
-    audioEngine.seekToSec(sec);
-    setCurrentTimeSec(sec);
-  };
+  const handleSeek = useCallback(
+    (sec: number) => {
+      audioEngine.seekToSec(sec);
+      updatePlayheadPosition(sec);
+      setCurrentTimeSec(sec);
+    },
+    [updatePlayheadPosition]
+  );
 
   // Spacebar shortcut for Play/Pause (when not typing in inputs)
   useEffect(() => {
@@ -552,6 +603,11 @@ export function App() {
     Math.round(durationSec * effectivePxPerSec)
   );
 
+  useEffect(() => {
+    effectivePxPerSecRef.current = effectivePxPerSec;
+    updatePlayheadPosition(currentTimeRef.current);
+  }, [effectivePxPerSec, activeProject?.project_id, updatePlayheadPosition]);
+
   const handleOpenDefaultRegion = () => {
     const start = Math.min(4, Math.max(0, durationSec * 0.25));
     const end = Math.min(durationSec, start + Math.min(4, durationSec * 0.35));
@@ -564,6 +620,8 @@ export function App() {
       <GpuConnectionBar
         serverUrl={serverUrl}
         onUpdateServerUrl={handleUpdateServerUrl}
+        apiToken={apiToken}
+        onUpdateApiToken={handleUpdateApiToken}
         health={health}
         latencyMs={latencyMs}
         connectionError={connectionError}
@@ -669,7 +727,14 @@ export function App() {
               </div>
 
               <div ref={timelineScrollRef} className="flex-1 overflow-auto">
-                <div className="min-w-max">
+                <div className="relative min-w-max">
+                  {/* Unified 60fps GPU-Composited Playhead across tracks (clipped behind sticky w-64 controls) */}
+                  <div
+                    ref={playheadRef}
+                    style={{ transform: `translate3d(${currentTimeRef.current * effectivePxPerSec}px, 0, 0)` }}
+                    className="pointer-events-none absolute top-0 bottom-0 left-64 z-[25] w-[1.5px] bg-rose-500 will-change-transform"
+                  />
+
                   {/* Beat Grid Header */}
                   <div className="sticky top-0 z-30 flex border-b border-studio-border bg-studio-panel">
                     <div className="sticky left-0 z-30 flex w-64 shrink-0 items-center justify-between border-r border-studio-border bg-studio-panel px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
@@ -680,9 +745,9 @@ export function App() {
                       grid={grid}
                       pixelsPerSec={effectivePxPerSec}
                       timelineWidthPx={timelineWidthPx}
-                      currentTimeSec={currentTimeSec}
                       snapMode={snapMode}
                       selection={selection}
+                      playheadRef={rulerPlayheadRef}
                       onSeek={handleSeek}
                       onSelectRegion={handleSelectRegion}
                     />
@@ -697,14 +762,13 @@ export function App() {
                       grid={grid}
                       pixelsPerSec={effectivePxPerSec}
                       timelineWidthPx={timelineWidthPx}
-                      currentTimeSec={currentTimeSec}
                       snapMode={snapMode}
                       selection={selection}
                       exportScope={exportScope}
                       isDspSelected={dspTrackId === track.track_id}
                       onUpdateTrack={handleUpdateTrack}
-                      onOpenDsp={(id) => setDspTrackId((prev) => (prev === id ? null : id))}
-                      onExportTrack={(id) => handleExport("single_track_wav", id)}
+                      onOpenDsp={handleToggleDspTrack}
+                      onExportTrack={handleExportTrack}
                       onSeek={handleSeek}
                       onSelectRegion={handleSelectRegion}
                       busy={busy}

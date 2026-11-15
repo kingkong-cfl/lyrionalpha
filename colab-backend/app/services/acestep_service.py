@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.io import wavfile
 
 from app.config import settings
 from app.core.model_manager import ModelType, model_manager
@@ -246,17 +249,198 @@ def _synthesize_musical_mix(
     return np.ascontiguousarray(stereo, dtype=np.float32)
 
 
+def _filter_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter candidate kwargs to those accepted by `callable_obj` unless it accepts **kwargs."""
+    try:
+        sig = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return kwargs
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _read_and_fit_stereo(audio_path: Path, target_sr: int, total_samples: int) -> np.ndarray:
+    """Read an audio file as float32 (total_samples, 2) at `target_sr`."""
+    try:
+        import soundfile as sf  # type: ignore
+
+        data, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
+    except ImportError:
+        sr, raw = wavfile.read(str(audio_path))
+        data = StorageManager._pcm_to_float32(raw)
+
+    stereo = StorageManager.ensure_stereo_float32(data)
+    if sr != target_sr:
+        stereo = StorageManager.resample_audio(stereo, sr, target_sr)
+    if stereo.shape[0] > total_samples:
+        stereo = stereo[:total_samples]
+    elif stereo.shape[0] < total_samples:
+        pad = np.zeros((total_samples - stereo.shape[0], 2), dtype=np.float32)
+        stereo = np.concatenate([stereo, pad], axis=0)
+    return np.ascontiguousarray(stereo, dtype=np.float32)
+
+
 def _load_acestep_model() -> Any:
     if settings.mock_gpu:
         return {"backend": "mock_acestep_1_5", "dtype": "bfloat16"}
 
     import torch  # type: ignore
-    from acestep.pipeline_ace_step import ACEStepPipeline  # type: ignore
 
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    pipeline = ACEStepPipeline(dtype=dtype)
-    pipeline.load_checkpoint()
-    return pipeline
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        from acestep.handler import AceStepHandler  # type: ignore
+        from acestep.inference import (  # type: ignore
+            GenerationConfig,
+            GenerationParams,
+            generate_music,
+        )
+
+        # Load DiT only (skipping 5Hz LLMHandler to save L4 VRAM since external LLM plans lyrics/BPM/key)
+        dit_handler = AceStepHandler()
+        init_kwargs = _filter_kwargs(
+            dit_handler.initialize_service,
+            {
+                "project_root": os.environ.get("ACESTEP_PROJECT_ROOT", ""),
+                "config_path": os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo"),
+                "device": device,
+            },
+        )
+        dit_handler.initialize_service(**init_kwargs)
+        return {
+            "version": "1.5",
+            "dit_handler": dit_handler,
+            "generate_music": generate_music,
+            "GenerationParams": GenerationParams,
+            "GenerationConfig": GenerationConfig,
+        }
+    except ImportError:
+        from acestep.pipeline_ace_step import ACEStepPipeline  # type: ignore
+
+        dtype = (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+        pipeline = ACEStepPipeline(dtype=dtype)
+        pipeline.load_checkpoint()
+        return {"version": "1.0", "pipeline": pipeline}
+
+
+def _invoke_acestep_real_sync(
+    pipe_bundle: Any,
+    *,
+    task_type: str,
+    prompt: str,
+    lyrics: str,
+    bpm: float,
+    musical_key: str,
+    duration_sec: float,
+    seed: int,
+    inference_steps: int,
+    guidance_scale: float,
+    target_sr: int,
+    total_samples: int,
+    src_audio: np.ndarray | None = None,
+    repaint_start_sec: float = 0.0,
+    repaint_end_sec: float = 0.0,
+) -> np.ndarray:
+    """Synchronous bridge supporting ACE-Step 1.5 (`AceStepHandler` + `generate_music`) with v1 fallback."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_path: Path | None = None
+        if src_audio is not None:
+            src_path = Path(tmpdir) / "source.wav"
+            float_src = np.ascontiguousarray(StorageManager.ensure_stereo_float32(src_audio), dtype=np.float32)
+            try:
+                import soundfile as sf  # type: ignore
+
+                sf.write(str(src_path), float_src, target_sr, subtype="FLOAT", format="WAV")
+            except ImportError:
+                wavfile.write(str(src_path), target_sr, float_src)
+
+        if isinstance(pipe_bundle, dict) and pipe_bundle.get("version") == "1.5":
+            params_cls = pipe_bundle["GenerationParams"]
+            config_cls = pipe_bundle["GenerationConfig"]
+            gen_fn = pipe_bundle["generate_music"]
+            dit_handler = pipe_bundle["dit_handler"]
+
+            param_kwargs: dict[str, Any] = {
+                "task_type": task_type,
+                "caption": prompt,
+                "prompt": prompt,
+                "lyrics": lyrics,
+                "bpm": int(round(bpm)),
+                "keyscale": musical_key,
+                "duration": float(duration_sec),
+                "seed": int(seed),
+                "inference_steps": int(inference_steps),
+                "guidance_scale": float(guidance_scale),
+                "thinking": False,
+            }
+            if src_path is not None:
+                param_kwargs["src_audio"] = str(src_path)
+                param_kwargs["repainting_start"] = float(repaint_start_sec)
+                param_kwargs["repainting_end"] = float(repaint_end_sec)
+
+            params = params_cls(**_filter_kwargs(params_cls, param_kwargs))
+            config = config_cls(**_filter_kwargs(config_cls, {"batch_size": 1, "audio_format": "wav"}))
+            result = gen_fn(
+                **_filter_kwargs(
+                    gen_fn,
+                    {
+                        "dit_handler": dit_handler,
+                        "llm_handler": None,
+                        "params": params,
+                        "config": config,
+                        "save_dir": str(tmpdir),
+                    },
+                )
+            )
+            if not getattr(result, "success", True):
+                raise RuntimeError(f"ACE-Step 1.5 inference failed: {getattr(result, 'error', 'unknown error')}")
+
+            out_file: Path | None = None
+            audios = getattr(result, "audios", None)
+            if isinstance(audios, (list, tuple)) and len(audios) > 0:
+                first = audios[0]
+                if isinstance(first, dict) and first.get("path"):
+                    out_file = Path(str(first["path"]))
+                elif hasattr(first, "path") and getattr(first, "path"):
+                    out_file = Path(str(getattr(first, "path")))
+                elif isinstance(first, (str, Path)):
+                    out_file = Path(str(first))
+            if out_file is None or not out_file.is_file():
+                resolved_src = src_path.resolve() if src_path is not None else None
+                candidates = [
+                    p
+                    for p in (sorted(Path(tmpdir).rglob("*.wav")) + sorted(Path(tmpdir).rglob("*.flac")))
+                    if p.resolve() != resolved_src
+                ]
+                if not candidates:
+                    raise FileNotFoundError("ACE-Step 1.5 inference produced no output audio file.")
+                out_file = candidates[0]
+
+            return _read_and_fit_stereo(out_file, target_sr, total_samples)
+
+        pipe = pipe_bundle["pipeline"] if isinstance(pipe_bundle, dict) and "pipeline" in pipe_bundle else pipe_bundle
+        out_path = Path(tmpdir) / "out.wav"
+        pipe_kwargs: dict[str, Any] = {
+            "audio_duration": float(duration_sec),
+            "prompt": prompt,
+            "lyrics": lyrics,
+            "infer_step": int(inference_steps),
+            "guidance_scale": float(guidance_scale),
+            "manual_seeds": [int(seed)],
+            "save_path": str(out_path),
+        }
+        if src_path is not None:
+            pipe_kwargs["task"] = task_type
+            pipe_kwargs["repaint_start"] = float(repaint_start_sec)
+            pipe_kwargs["repaint_end"] = float(repaint_end_sec)
+            pipe_kwargs["src_audio_path"] = str(src_path)
+        pipe(**pipe_kwargs)
+        return _read_and_fit_stereo(out_path, target_sr, total_samples)
 
 
 async def generate_full_song(
@@ -289,35 +473,23 @@ async def generate_full_song(
             )
             return audio, target_sr
 
-        # Real Colab L4 ACE-Step 1.5 execution
         prompt = ", ".join(style_tags + [f"{bpm} bpm", musical_key])
-
-        def _run_real() -> tuple[np.ndarray, int]:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                out_path = Path(tmpdir) / "gen.wav"
-                pipe(
-                    audio_duration=float(duration_sec),
-                    prompt=prompt,
-                    lyrics=structured_lyrics,
-                    infer_step=int(inference_steps),
-                    guidance_scale=float(guidance_scale),
-                    manual_seeds=[int(seed)],
-                    save_path=str(out_path),
-                )
-                import soundfile as sf  # type: ignore
-
-                data, sr = sf.read(str(out_path), dtype="float32", always_2d=True)
-                stereo = StorageManager.ensure_stereo_float32(data)
-                if sr != target_sr:
-                    stereo = StorageManager.resample_audio(stereo, sr, target_sr)
-                if stereo.shape[0] > total_samples:
-                    stereo = stereo[:total_samples]
-                elif stereo.shape[0] < total_samples:
-                    pad = np.zeros((total_samples - stereo.shape[0], 2), dtype=np.float32)
-                    stereo = np.concatenate([stereo, pad], axis=0)
-                return stereo, target_sr
-
-        return await asyncio.to_thread(_run_real)
+        stereo = await asyncio.to_thread(
+            _invoke_acestep_real_sync,
+            pipe,
+            task_type="text2music",
+            prompt=prompt,
+            lyrics=structured_lyrics,
+            bpm=bpm,
+            musical_key=musical_key,
+            duration_sec=duration_sec,
+            seed=seed,
+            inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            target_sr=target_sr,
+            total_samples=total_samples,
+        )
+        return stereo, target_sr
 
 
 async def repaint_region(
@@ -363,34 +535,26 @@ async def repaint_region(
         prompt_parts = ([instrument_hint] if instrument_hint else []) + style_tags + [f"{bpm} bpm", musical_key]
         prompt = ", ".join(p for p in prompt_parts if p)
 
-        def _run_real_repaint() -> np.ndarray:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                src_path = Path(tmpdir) / "source.wav"
-                out_path = Path(tmpdir) / "repainted.wav"
-                import soundfile as sf  # type: ignore
-
-                sf.write(str(src_path), source_mix, target_sr, subtype="PCM_16")
-                pipe(
-                    audio_duration=total_samples / float(target_sr),
-                    prompt=prompt,
-                    lyrics=lyrics_override,
-                    infer_step=int(inference_steps),
-                    guidance_scale=float(guidance_scale),
-                    manual_seeds=[int(seed)],
-                    task="repaint",
-                    repaint_start=start_sample / float(target_sr),
-                    repaint_end=end_sample / float(target_sr),
-                    src_audio_path=str(src_path),
-                    save_path=str(out_path),
-                )
-                data, sr = sf.read(str(out_path), dtype="float32", always_2d=True)
-                stereo = StorageManager.ensure_stereo_float32(data)
-                if sr != target_sr:
-                    stereo = StorageManager.resample_audio(stereo, sr, target_sr)
-                seg = stereo[start_sample:end_sample]
-                if seg.shape[0] < region_len:
-                    pad = np.zeros((region_len - seg.shape[0], 2), dtype=np.float32)
-                    seg = np.concatenate([seg, pad], axis=0)
-                return seg[:region_len]
-
-        return await asyncio.to_thread(_run_real_repaint)
+        stereo = await asyncio.to_thread(
+            _invoke_acestep_real_sync,
+            pipe,
+            task_type="repaint",
+            prompt=prompt,
+            lyrics=lyrics_override,
+            bpm=bpm,
+            musical_key=musical_key,
+            duration_sec=total_samples / float(target_sr),
+            seed=seed,
+            inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            target_sr=target_sr,
+            total_samples=total_samples,
+            src_audio=source_mix,
+            repaint_start_sec=start_sample / float(target_sr),
+            repaint_end_sec=end_sample / float(target_sr),
+        )
+        seg = stereo[start_sample:end_sample]
+        if seg.shape[0] < region_len:
+            pad = np.zeros((region_len - seg.shape[0], 2), dtype=np.float32)
+            seg = np.concatenate([seg, pad], axis=0)
+        return np.ascontiguousarray(seg[:region_len], dtype=np.float32)

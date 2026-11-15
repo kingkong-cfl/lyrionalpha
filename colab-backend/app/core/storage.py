@@ -126,7 +126,7 @@ class StorageManager:
         audio: np.ndarray,
         sample_rate: int = settings.sample_rate,
     ) -> Path:
-        """Write canonical float32 stereo audio normalized to 16-bit PCM WAV."""
+        """Write canonical float32 stereo audio as lossless 32-bit IEEE Float WAV."""
         target = self.resolve_project_file(project_id, rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         stereo = self.ensure_stereo_float32(audio)
@@ -134,13 +134,13 @@ class StorageManager:
             stereo = self.resample_audio(stereo, sample_rate, settings.sample_rate)
             sample_rate = settings.sample_rate
 
-        pcm16 = np.clip(np.round(stereo * 32768.0), -32768.0, 32767.0).astype(np.int16)
+        float_stereo = np.ascontiguousarray(stereo, dtype=np.float32)
         tmp_path = target.with_suffix(".wav.tmp")
 
         if sf is not None:
-            sf.write(str(tmp_path), pcm16, sample_rate, subtype="PCM_16", format="WAV")
+            sf.write(str(tmp_path), float_stereo, sample_rate, subtype="FLOAT", format="WAV")
         else:
-            wavfile.write(str(tmp_path), sample_rate, pcm16)
+            wavfile.write(str(tmp_path), sample_rate, float_stereo)
         os.replace(tmp_path, target)
         return target
 

@@ -12,4 +12,4 @@ python-dotenv>=1.0.1
 # Installed inside Google Colab L4 bootstrap:
 # torch
 # torchaudio
-# ace-step (from git+https://github.com/ace-step/ACE-Step.git)
+# ace-step (from git+https://github.com/ACE-Step/ACE-Step-1.5.git)

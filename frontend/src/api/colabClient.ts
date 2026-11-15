@@ -8,6 +8,7 @@ import type {
 } from "../types/project";
 
 const STORAGE_KEY = "lyrion_gpu_server_url";
+const TOKEN_STORAGE_KEY = "lyrion_api_token";
 const DEFAULT_SERVER_URL = "http://localhost:8000";
 
 export function getSavedServerUrl(): string {
@@ -21,12 +22,29 @@ export function setSavedServerUrl(url: string): string {
   return cleaned;
 }
 
+export function getSavedApiToken(): string {
+  const saved = localStorage.getItem(TOKEN_STORAGE_KEY);
+  return saved ? saved.trim() : "";
+}
+
+export function setSavedApiToken(token: string): string {
+  const cleaned = token.trim();
+  if (cleaned) {
+    localStorage.setItem(TOKEN_STORAGE_KEY, cleaned);
+  } else {
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+  }
+  return cleaned;
+}
+
 async function apiFetch<T>(baseUrl: string, path: string, init?: RequestInit): Promise<T> {
   const url = `${baseUrl.replace(/\/+$/, "")}${path}`;
+  const token = getSavedApiToken();
   const resp = await fetch(url, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers || {}),
     },
   });
@@ -51,7 +69,20 @@ export function buildTrackAudioUrl(
   revision: number
 ): string {
   const cleanBase = baseUrl.replace(/\/+$/, "");
-  return `${cleanBase}/api/v1/projects/${encodeURIComponent(projectId)}/audio/${fileRelPath}?rev=${revision}`;
+  const token = getSavedApiToken();
+  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
+  return `${cleanBase}/api/v1/projects/${encodeURIComponent(projectId)}/audio/${fileRelPath}?rev=${revision}${tokenParam}`;
+}
+
+export function buildDownloadAudioUrl(
+  baseUrl: string,
+  projectId: string,
+  fileRelPath: string
+): string {
+  const cleanBase = baseUrl.replace(/\/+$/, "");
+  const token = getSavedApiToken();
+  const query = token ? `?token=${encodeURIComponent(token)}` : "";
+  return `${cleanBase}/api/v1/projects/${encodeURIComponent(projectId)}/audio/${fileRelPath}${query}`;
 }
 
 export async function fetchHealth(baseUrl: string): Promise<{ health: HealthResponse; latencyMs: number }> {

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -55,16 +56,16 @@ def install_dependencies() -> None:
     print("[Bootstrap] Installing Python backend packages...")
     run(f"{sys.executable} -m pip install -q -r requirements.txt")
 
-    # Install ACE-Step 1.5 if missing
+    # Install ACE-Step 1.5 if missing (with v1 fallback if upstream 1.5 package name unavailable)
     check_ace = subprocess.run(
         [sys.executable, "-c", "import acestep"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     if check_ace.returncode != 0:
-        print("[Bootstrap] Installing ACE-Step from GitHub...")
+        print("[Bootstrap] Installing ACE-Step 1.5 from GitHub...")
         run(
-            f"{sys.executable} -m pip install -q git+https://github.com/ace-step/ACE-Step.git",
+            f"{sys.executable} -m pip install -q git+https://github.com/ACE-Step/ACE-Step-1.5.git",
             check=False,
         )
         verify_ace = subprocess.run(
@@ -73,9 +74,20 @@ def install_dependencies() -> None:
             stderr=subprocess.DEVNULL,
         )
         if verify_ace.returncode != 0:
+            print("[Bootstrap] Retrying with fallback ACE-Step repository...")
+            run(
+                f"{sys.executable} -m pip install -q git+https://github.com/ace-step/ACE-Step.git",
+                check=False,
+            )
+            verify_ace = subprocess.run(
+                [sys.executable, "-c", "import acestep"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        if verify_ace.returncode != 0:
             print(
                 "[Bootstrap] WARNING: 'acestep' failed to import after pip install! "
-                "Real GPU generation/repaint will fail unless ACE-Step is installed manually "
+                "Real GPU generation/repaint will fail unless ACE-Step 1.5 is installed manually "
                 "(or set MOCK_GPU=true).",
                 flush=True,
             )
@@ -113,6 +125,11 @@ def main() -> None:
     os.environ.setdefault("MOCK_GPU", "false")
     os.environ["DRIVE_ROOT"] = str(drive_root)
 
+    api_token = os.environ.get("LYRION_API_TOKEN", "").strip()
+    if not api_token:
+        api_token = secrets.token_urlsafe(24)
+        os.environ["LYRION_API_TOKEN"] = api_token
+
     if Path("/content").exists():
         install_dependencies()
 
@@ -125,7 +142,8 @@ def main() -> None:
     print(f"  Drive Storage : {drive_root}")
     print(f"  GPU Mode      : {'MOCK_GPU' if os.environ.get('MOCK_GPU') == 'true' else 'CUDA bfloat16'}")
     print(f"  Public URL    : {tunnel_url or '(Wait 5s and check /tmp/cloudflared_lyrion.log)'}")
-    print("  Paste the Public URL into the Lyrion Frontend top bar!")
+    print(f"  API Token     : {api_token}")
+    print("  Paste both Public URL and API Token into the Lyrion Frontend top bar!")
     print("=" * 72 + "\n", flush=True)
 
     try:

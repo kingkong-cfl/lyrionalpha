@@ -6,20 +6,20 @@ interface BeatGridRulerProps {
   grid: BeatGridSchema;
   pixelsPerSec: number;
   timelineWidthPx: number;
-  currentTimeSec: number;
   snapMode: SnapMode;
   selection: RegionSelection | null;
+  playheadRef?: React.RefObject<HTMLDivElement>;
   onSeek: (sec: number) => void;
   onSelectRegion: (region: RegionSelection | null) => void;
 }
 
-export const BeatGridRuler: React.FC<BeatGridRulerProps> = ({
+export const BeatGridRuler: React.FC<BeatGridRulerProps> = React.memo(({
   grid,
   pixelsPerSec,
   timelineWidthPx,
-  currentTimeSec,
   snapMode,
   selection,
+  playheadRef,
   onSeek,
   onSelectRegion,
 }) => {
@@ -102,18 +102,7 @@ export const BeatGridRuler: React.FC<BeatGridRulerProps> = ({
     ctx.moveTo(0, height - 0.5);
     ctx.lineTo(totalWidth, height - 0.5);
     ctx.stroke();
-
-    // Playhead indicator
-    const px = Math.round(currentTimeSec * pixelsPerSec);
-    ctx.fillStyle = "#f43f5e";
-    ctx.beginPath();
-    ctx.moveTo(px - 6, 0);
-    ctx.lineTo(px + 6, 0);
-    ctx.lineTo(px, 10);
-    ctx.closePath();
-    ctx.fill();
-    ctx.fillRect(px - 0.5, 8, 1.5, height - 8);
-  }, [grid, pixelsPerSec, totalWidth, currentTimeSec, selection]);
+  }, [grid, pixelsPerSec, totalWidth, selection]);
 
   const timeFromPointer = (clientX: number): number => {
     const canvas = canvasRef.current;
@@ -148,7 +137,7 @@ export const BeatGridRuler: React.FC<BeatGridRulerProps> = ({
   };
 
   return (
-    <div className="relative select-none" style={{ width: `${totalWidth}px` }}>
+    <div className="relative select-none overflow-hidden" style={{ width: `${totalWidth}px` }}>
       <canvas
         ref={canvasRef}
         onMouseDown={handleMouseDown}
@@ -159,6 +148,16 @@ export const BeatGridRuler: React.FC<BeatGridRulerProps> = ({
         style={{ width: `${totalWidth}px`, height: `${height}px` }}
         className="block cursor-crosshair"
       />
+      {playheadRef && (
+        <div
+          ref={playheadRef}
+          style={{ transform: "translate3d(0px, 0, 0)" }}
+          className="pointer-events-none absolute top-0 bottom-0 left-0 z-20 will-change-transform"
+        >
+          <div className="absolute -left-[5.5px] top-0 h-0 w-0 border-x-[6px] border-t-[10px] border-x-transparent border-t-rose-500" />
+          <div className="h-full w-[1.5px] bg-rose-500" />
+        </div>
+      )}
     </div>
   );
-};
+});

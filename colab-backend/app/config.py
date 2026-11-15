@@ -60,6 +60,7 @@ class Settings:
     groq_model: str = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
     nvidia_nim_api_key: str = os.environ.get("NVIDIA_NIM_API_KEY", "").strip()
     nvidia_nim_model: str = os.environ.get("NVIDIA_NIM_MODEL", "meta/llama-3.3-70b-instruct").strip()
+    api_token: str = os.environ.get("LYRION_API_TOKEN", "").strip()
     allowed_origins: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:

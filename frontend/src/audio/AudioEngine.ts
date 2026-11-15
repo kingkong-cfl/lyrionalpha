@@ -17,8 +17,7 @@ interface LoadedTrackNode {
   midFilter: Tone.BiquadFilter;
   highFilter: Tone.BiquadFilter;
   channel: Tone.Channel;
-  peaks: Float32Array[];
-  duration: number;
+  waveform: TrackWaveformData;
 }
 
 function extractWaveformPeaks(
@@ -69,13 +68,7 @@ export class StudioAudioEngine {
   private loadRequestId = 0;
 
   public getTrackWaveform(trackId: string): TrackWaveformData | null {
-    const node = this.nodes.get(trackId);
-    if (!node) return null;
-    return {
-      url: node.url,
-      peaks: node.peaks,
-      duration: node.duration,
-    };
+    return this.nodes.get(trackId)?.waveform ?? null;
   }
 
   public async loadProjectTracks(baseUrl: string, project: ProjectSchema): Promise<void> {
@@ -201,6 +194,7 @@ export class StudioAudioEngine {
 
       player.sync().start(0);
       const { peaks, duration } = extractWaveformPeaks(buffer);
+      const waveform: TrackWaveformData = { url, peaks, duration };
 
       this.nodes.set(track.track_id, {
         trackId: track.track_id,
@@ -211,8 +205,7 @@ export class StudioAudioEngine {
         midFilter,
         highFilter,
         channel,
-        peaks,
-        duration,
+        waveform,
       });
     }
 

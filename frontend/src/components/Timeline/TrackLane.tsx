@@ -11,7 +11,6 @@ interface TrackLaneProps {
   grid: BeatGridSchema;
   pixelsPerSec: number;
   timelineWidthPx: number;
-  currentTimeSec: number;
   snapMode: SnapMode;
   selection: RegionSelection | null;
   exportScope: "full" | "region";
@@ -33,13 +32,12 @@ const ROLE_COLORS: Record<string, { wave: string; progress: string; badge: strin
   custom: { wave: "#818cf8", progress: "#6366f1", badge: "bg-indigo-500/20 text-indigo-300" },
 };
 
-export const TrackLane: React.FC<TrackLaneProps> = ({
+export const TrackLane: React.FC<TrackLaneProps> = React.memo(({
   track,
   waveform,
   grid,
   pixelsPerSec,
   timelineWidthPx,
-  currentTimeSec,
   snapMode,
   selection,
   exportScope,
@@ -62,11 +60,6 @@ export const TrackLane: React.FC<TrackLaneProps> = ({
   const palette = ROLE_COLORS[track.stem_role] || ROLE_COLORS.custom;
   const durationSec = Math.max(grid.duration_sec || 16, 1);
   const timelineWidth = Math.max(200, Math.round(timelineWidthPx));
-
-  const latestCurrentTimeRef = useRef<number>(currentTimeSec);
-  const latestDurationSecRef = useRef<number>(durationSec);
-  latestCurrentTimeRef.current = currentTimeSec;
-  latestDurationSecRef.current = durationSec;
 
   const barGridTimes = useMemo(
     () =>
@@ -108,13 +101,8 @@ export const TrackLane: React.FC<TrackLaneProps> = ({
       wsReadyRef.current = true;
       try {
         ws.zoom(latestPxPerSecRef.current);
-        const ratio = Math.max(
-          0,
-          Math.min(1, latestCurrentTimeRef.current / Math.max(latestDurationSecRef.current, 1))
-        );
-        ws.seekTo(ratio);
       } catch {
-        // Ignore zoom/seek race on fast unmount
+        // Ignore zoom race on fast unmount
       }
     });
 
@@ -149,14 +137,6 @@ export const TrackLane: React.FC<TrackLaneProps> = ({
     });
   }, [track.muted, palette.wave, palette.progress]);
 
-  // Keep Wavesurfer progress bar in sync with Tone.Transport clock
-  useEffect(() => {
-    const ws = wsRef.current;
-    if (!ws || !wsReadyRef.current || durationSec <= 0) return;
-    const ratio = Math.max(0, Math.min(1, currentTimeSec / durationSec));
-    ws.seekTo(ratio);
-  }, [currentTimeSec, durationSec]);
-
   const timeFromMouseEvent = (e: React.MouseEvent<HTMLDivElement>): number => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = Math.max(0, e.clientX - rect.left);
@@ -189,7 +169,7 @@ export const TrackLane: React.FC<TrackLaneProps> = ({
   return (
     <div className="flex border-b border-studio-border bg-studio-bg/80 hover:bg-studio-panel/40 transition-colors">
       {/* Sticky Left Track Header (Mixer Strip) */}
-      <div className="sticky left-0 z-20 flex w-64 shrink-0 flex-col justify-between border-r border-studio-border bg-studio-panel p-2.5">
+      <div className="sticky left-0 z-30 flex w-64 shrink-0 flex-col justify-between border-r border-studio-border bg-studio-panel p-2.5">
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
@@ -330,12 +310,7 @@ export const TrackLane: React.FC<TrackLaneProps> = ({
           />
         )}
 
-        {/* Synchronized Playhead Line */}
-        <div
-          style={{ left: `${currentTimeSec * pixelsPerSec}px` }}
-          className="pointer-events-none absolute top-0 bottom-0 z-20 w-[1.5px] bg-rose-500"
-        />
       </div>
     </div>
   );
-};
+});
