@@ -1,0 +1,396 @@
+"""ACE-Step 1.5 service (bfloat16 on Colab L4 GPU, musical synthesis in MOCK_GPU mode)."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from app.config import settings
+from app.core.model_manager import ModelType, model_manager
+from app.core.storage import StorageManager, storage
+
+logger = logging.getLogger("lyrion.acestep")
+
+
+_KEY_ROOT_HZ = {
+    "C": 261.63,
+    "C#": 277.18,
+    "Db": 277.18,
+    "D": 293.66,
+    "D#": 311.13,
+    "Eb": 311.13,
+    "E": 329.63,
+    "F": 349.23,
+    "F#": 369.99,
+    "Gb": 369.99,
+    "G": 392.00,
+    "G#": 415.30,
+    "Ab": 415.30,
+    "A": 220.00,
+    "A#": 233.08,
+    "Bb": 233.08,
+    "B": 246.94,
+}
+
+
+def _parse_key_scale(musical_key: str) -> list[float]:
+    parts = musical_key.strip().split()
+    root_name = parts[0] if parts else "A"
+    is_minor = any("min" in p.lower() for p in parts[1:]) or "m" == root_name[-1:]
+    root_clean = root_name.rstrip("m") if len(root_name) > 1 and root_name.endswith("m") else root_name
+    base_hz = _KEY_ROOT_HZ.get(root_clean, 220.0)
+    semitones = [0, 2, 3, 5, 7, 8, 10, 12] if is_minor else [0, 2, 4, 5, 7, 9, 11, 12]
+    return [base_hz * (2.0 ** (st / 12.0)) for st in semitones]
+
+
+def _synthesize_musical_mix(
+    total_samples: int,
+    sample_rate: int,
+    bpm: float,
+    musical_key: str,
+    seed: int,
+    style_tags: list[str],
+    layer_mode: str = "full",
+    instrument_hint: str = "",
+) -> np.ndarray:
+    """Generate a rich, phase-coherent stereo arrangement for local MOCK_GPU=true development."""
+    rng = np.random.default_rng(abs(int(seed)) % (2**31 - 1))
+    t = np.arange(total_samples, dtype=np.float32) / float(sample_rate)
+    beat_sec = 60.0 / max(45.0, float(bpm))
+    beat_pos = t / beat_sec
+    beat_idx = np.floor(beat_pos).astype(np.int32)
+    bar_idx = beat_idx // 4
+    sixteenth_idx = np.floor(beat_pos * 4.0).astype(np.int32)
+    sixteenth_frac = (beat_pos * 4.0) % 1.0
+    step16_mod = sixteenth_idx % 16
+    step8_mod = (np.floor(beat_pos * 2.0).astype(np.int32)) % 8
+
+    scale = _parse_key_scale(musical_key)
+    progression_degrees = rng.choice([0, 2, 3, 4, 5], size=4, replace=True)
+
+    # 1. Bassline (sub-150Hz fundamental + seed-varied groove & harmonic warmth)
+    bass_mono = np.zeros(total_samples, dtype=np.float32)
+    if layer_mode in ("full", "bass"):
+        bass_subdiv = float(rng.choice([2.0, 4.0]))
+        bass_oct = np.where(rng.random(8) < 0.30, 0.5, 0.25).astype(np.float32)
+        bass_gate = np.where(rng.random(8) < 0.82, 1.0, 0.25).astype(np.float32)
+        bass_gate[0] = 1.0
+        bass_decay = float(rng.uniform(2.2, 4.8))
+        bass_h2 = float(rng.uniform(0.05, 0.14))
+
+        root_seq = (
+            np.array([scale[progression_degrees[b % 4]] for b in bar_idx], dtype=np.float32)
+            * bass_oct[step8_mod]
+        )
+        bass_phase_pos = (beat_pos * bass_subdiv) % 1.0
+        bass_env = np.exp(-bass_decay * bass_phase_pos).astype(np.float32) * bass_gate[step8_mod]
+        phase_bass = 2.0 * np.pi * np.cumsum(root_seq / sample_rate)
+        bass_mono = (0.30 * np.sin(phase_bass) + bass_h2 * np.sin(2.0 * phase_bass)) * bass_env
+
+    # 2. Drums (seed-varied syncopated kick/snare groove & 16th hi-hat accents)
+    drums_l = np.zeros(total_samples, dtype=np.float32)
+    drums_r = np.zeros(total_samples, dtype=np.float32)
+    if layer_mode in ("full", "drums"):
+        kick_mask = np.zeros(16, dtype=np.float32)
+        kick_mask[0] = 1.0
+        kick_mask[8] = 1.0
+        for sync_step in (2, 3, 6, 10, 14):
+            if rng.random() < 0.50:
+                kick_mask[sync_step] = float(rng.uniform(0.75, 1.0))
+        kick_base_hz = float(rng.uniform(44.0, 60.0))
+        kick_punch_hz = float(rng.uniform(75.0, 120.0))
+        kick_decay = float(rng.uniform(5.5, 9.5))
+
+        kick_freq = kick_base_hz + kick_punch_hz * np.exp(-16.0 * sixteenth_frac)
+        kick_env = np.exp(-kick_decay * sixteenth_frac) * kick_mask[step16_mod]
+        kick = 0.42 * np.sin(2.0 * np.pi * np.cumsum(kick_freq / sample_rate)) * kick_env
+
+        snare_mask = np.zeros(16, dtype=np.float32)
+        snare_mask[4] = 1.0
+        snare_mask[12] = 1.0
+        for ghost_step in (2, 7, 10, 15):
+            if rng.random() < 0.45:
+                snare_mask[ghost_step] = float(rng.uniform(0.30, 0.55))
+        snare_body_hz = float(rng.uniform(175.0, 240.0))
+        snare_decay = float(rng.uniform(9.0, 16.0))
+
+        noise = rng.standard_normal(total_samples).astype(np.float32)
+        snare_amp = snare_mask[step16_mod]
+        snare_env = np.exp(-snare_decay * sixteenth_frac) * snare_amp
+        snare_body = np.sin(2.0 * np.pi * snare_body_hz * t) * np.exp(-14.0 * sixteenth_frac) * snare_amp
+        snare = (0.16 * noise * snare_env) + (0.14 * snare_body)
+
+        hat_accents = rng.uniform(0.35, 1.30, size=16).astype(np.float32)
+        hat_mask = rng.choice([0.0, 1.0], size=16, p=[0.18, 0.82]).astype(np.float32)
+        hat_decay = float(rng.uniform(18.0, 42.0))
+        hat_noise = np.diff(noise, prepend=0.0)
+        hat_env = np.exp(-hat_decay * sixteenth_frac) * hat_accents[step16_mod] * hat_mask[step16_mod]
+        hats = 0.06 * hat_noise * hat_env
+
+        drums_l = kick + snare + hats * 1.1
+        drums_r = kick + snare + hats * 0.9
+
+    # 3. Stereo Pad / Synth Harmony ("other" stem, >3.8kHz & wide stereo)
+    other_l = np.zeros(total_samples, dtype=np.float32)
+    other_r = np.zeros(total_samples, dtype=np.float32)
+    if layer_mode in ("full", "other", "custom"):
+        chord_mod = float(rng.choice([0.25, 1.0, 2.0, 4.0]))
+        voicing_third = float(rng.choice([1.189, 1.260, 1.335]))
+        voicing_fifth = float(rng.choice([1.498, 1.682, 1.888]))
+        lfo_rate = float(rng.uniform(0.25, 1.15))
+        bright_hz = float(rng.uniform(3600.0, 5400.0))
+        detune_phases = rng.uniform(0.15, 1.1, size=3)
+
+        chord_freqs = np.array([scale[progression_degrees[b % 4]] for b in bar_idx], dtype=np.float32)
+        third_freqs = chord_freqs * voicing_third
+        fifth_freqs = chord_freqs * voicing_fifth
+        pad_frac = (beat_pos * chord_mod) % 1.0
+        pad_env = np.minimum(1.0, pad_frac * 8.0) * np.exp(-1.1 * pad_frac)
+        p1 = 2.0 * np.pi * np.cumsum(chord_freqs / sample_rate)
+        p2 = 2.0 * np.pi * np.cumsum(third_freqs / sample_rate)
+        p3 = 2.0 * np.pi * np.cumsum(fifth_freqs / sample_rate)
+        lfo = 0.5 + 0.5 * np.sin(2.0 * np.pi * lfo_rate * t)
+        bright = 0.05 * np.sin(2.0 * np.pi * bright_hz * t) * (0.4 + 0.6 * lfo)
+        other_l = 0.10 * (
+            np.sin(p1) + 0.7 * np.sin(p2 + float(detune_phases[0])) + 0.6 * np.sin(p3)
+        ) * pad_env + bright
+        other_r = 0.10 * (
+            np.sin(p1 + float(detune_phases[1])) + 0.7 * np.sin(p2) + 0.6 * np.sin(p3 + float(detune_phases[2]))
+        ) * pad_env - bright * 0.8
+
+    # 4. Vocal-like melodic lead (centered mid-band 450Hz-2400Hz with seed-varied vibrato/melody)
+    vocal_mono = np.zeros(total_samples, dtype=np.float32)
+    if layer_mode in ("full", "vocals"):
+        vocal_div = float(rng.choice([2.0, 3.0, 4.0]))
+        step_idx = np.floor(beat_pos * vocal_div).astype(np.int32)
+        melody_pattern = rng.integers(0, len(scale), size=16)
+        vocal_gate = rng.choice([0.0, 1.0], size=16, p=[0.22, 0.78]).astype(np.float32)
+        vocal_gate[0] = 1.0
+        vocal_gate[8] = 1.0
+        vibrato_rate = float(rng.uniform(4.6, 6.6))
+        vibrato_depth = float(rng.uniform(0.005, 0.013))
+        h2_amp = float(rng.uniform(0.05, 0.12))
+        h3_amp = float(rng.uniform(0.02, 0.06))
+
+        step_frac = (beat_pos * vocal_div) % 1.0
+        step_mod = step_idx % len(melody_pattern)
+        note_freqs = np.array([scale[melody_pattern[s]] * 2.0 for s in step_mod], dtype=np.float32)
+        vibrato = 1.0 + vibrato_depth * np.sin(2.0 * np.pi * vibrato_rate * t)
+        vocal_phase = 2.0 * np.pi * np.cumsum((note_freqs * vibrato) / sample_rate)
+        phrase_gate = ((bar_idx % 4) < 3).astype(np.float32) * vocal_gate[step_mod]
+        note_env = np.minimum(1.0, step_frac * 14.0) * np.exp(-2.2 * step_frac) * phrase_gate
+        vocal_mono = (
+            0.16 * np.sin(vocal_phase)
+            + h2_amp * np.sin(2.0 * vocal_phase)
+            + h3_amp * np.sin(3.0 * vocal_phase)
+        ) * note_env
+
+    # 5. Custom standalone instrument layer (electric guitar / lead synth / brass / keys)
+    inst_l = np.zeros(total_samples, dtype=np.float32)
+    inst_r = np.zeros(total_samples, dtype=np.float32)
+    if layer_mode == "custom":
+        hint = (instrument_hint + " " + " ".join(style_tags)).lower()
+        riff_div = float(rng.choice([2.0, 4.0]))
+        step_idx = np.floor(beat_pos * riff_div).astype(np.int32)
+        riff_pattern = rng.integers(0, len(scale), size=16)
+        riff_gate = rng.choice([0.0, 1.0], size=16, p=[0.20, 0.80]).astype(np.float32)
+        riff_gate[0] = 1.0
+        riff_gate[4] = 1.0
+        drive = float(rng.uniform(1.8, 3.2))
+        detune_rad = float(rng.uniform(0.12, 0.45))
+
+        step_frac = (beat_pos * riff_div) % 1.0
+        step_mod = step_idx % len(riff_pattern)
+        octave = 2.0 if any(k in hint for k in ("lead", "synth", "flute", "violin")) else 1.0
+        note_freqs = np.array([scale[riff_pattern[s]] * octave for s in step_mod], dtype=np.float32)
+        phase = 2.0 * np.pi * np.cumsum(note_freqs / sample_rate)
+        gate_mult = riff_gate[step_mod]
+
+        if "guitar" in hint:
+            pluck_env = np.minimum(1.0, step_frac * 24.0) * np.exp(-4.5 * step_frac) * gate_mult
+            raw_wave = np.tanh(drive * (np.sin(phase) + 0.5 * np.sin(2.0 * phase) + 0.3 * np.sin(3.0 * phase)))
+            inst_l = 0.22 * raw_wave * pluck_env
+            inst_r = 0.22 * np.tanh(drive * np.sin(phase + detune_rad)) * pluck_env
+        elif any(k in hint for k in ("brass", "horn", "sax")):
+            swell_env = np.minimum(1.0, step_frac * 6.0) * np.exp(-1.5 * step_frac) * gate_mult
+            raw_wave = 0.6 * np.sin(phase) + 0.4 * np.sin(2.0 * phase) + 0.25 * np.sin(3.0 * phase)
+            inst_l = 0.22 * raw_wave * swell_env
+            inst_r = 0.20 * np.sin(phase + detune_rad) * swell_env + 0.08 * raw_wave * swell_env
+        else:
+            arp_env = np.minimum(1.0, step_frac * 18.0) * np.exp(-3.0 * step_frac) * gate_mult
+            raw_wave = 0.65 * np.sin(phase) + 0.35 * np.sin(2.0 * phase + detune_rad) + 0.15 * np.sin(4.0 * phase)
+            inst_l = 0.22 * raw_wave * arp_env
+            inst_r = 0.22 * np.sin(phase + detune_rad * 1.5) * arp_env
+
+    mix_l = bass_mono + drums_l + other_l + vocal_mono + inst_l
+    mix_r = bass_mono + drums_r + other_r + vocal_mono + inst_r
+    stereo = np.stack([mix_l, mix_r], axis=-1).astype(np.float32)
+
+    # Soft limiter headroom
+    peak = float(np.max(np.abs(stereo))) if stereo.size else 1.0
+    if peak > 0.92:
+        stereo = stereo * (0.92 / peak)
+
+    # Gentle 10ms fade-in/out on full song endpoints
+    fade = min(441, total_samples // 10)
+    if fade > 0:
+        ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
+        stereo[:fade] *= ramp
+        stereo[-fade:] *= ramp[::-1]
+
+    return np.ascontiguousarray(stereo, dtype=np.float32)
+
+
+def _load_acestep_model() -> Any:
+    if settings.mock_gpu:
+        return {"backend": "mock_acestep_1_5", "dtype": "bfloat16"}
+
+    import torch  # type: ignore
+    from acestep.pipeline_ace_step import ACEStepPipeline  # type: ignore
+
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    pipeline = ACEStepPipeline(dtype=dtype)
+    pipeline.load_checkpoint()
+    return pipeline
+
+
+async def generate_full_song(
+    *,
+    bpm: float,
+    musical_key: str,
+    duration_sec: float,
+    style_tags: list[str],
+    structured_lyrics: str,
+    seed: int,
+    guidance_scale: float = 7.0,
+    inference_steps: int = 40,
+) -> tuple[np.ndarray, int]:
+    """Generate a full stereo mix at canonical 44,100 Hz using ACE-Step 1.5 in bfloat16."""
+    target_sr = settings.sample_rate
+    total_samples = max(target_sr, int(round(duration_sec * target_sr)))
+
+    async with model_manager.acquire(ModelType.ACE_STEP, _load_acestep_model) as pipe:
+        if settings.mock_gpu:
+            await asyncio.sleep(0.15)
+            audio = await asyncio.to_thread(
+                _synthesize_musical_mix,
+                total_samples,
+                target_sr,
+                bpm,
+                musical_key,
+                seed,
+                style_tags,
+                "full",
+            )
+            return audio, target_sr
+
+        # Real Colab L4 ACE-Step 1.5 execution
+        prompt = ", ".join(style_tags + [f"{bpm} bpm", musical_key])
+
+        def _run_real() -> tuple[np.ndarray, int]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_path = Path(tmpdir) / "gen.wav"
+                pipe(
+                    audio_duration=float(duration_sec),
+                    prompt=prompt,
+                    lyrics=structured_lyrics,
+                    infer_step=int(inference_steps),
+                    guidance_scale=float(guidance_scale),
+                    manual_seeds=[int(seed)],
+                    save_path=str(out_path),
+                )
+                import soundfile as sf  # type: ignore
+
+                data, sr = sf.read(str(out_path), dtype="float32", always_2d=True)
+                stereo = StorageManager.ensure_stereo_float32(data)
+                if sr != target_sr:
+                    stereo = StorageManager.resample_audio(stereo, sr, target_sr)
+                if stereo.shape[0] > total_samples:
+                    stereo = stereo[:total_samples]
+                elif stereo.shape[0] < total_samples:
+                    pad = np.zeros((total_samples - stereo.shape[0], 2), dtype=np.float32)
+                    stereo = np.concatenate([stereo, pad], axis=0)
+                return stereo, target_sr
+
+        return await asyncio.to_thread(_run_real)
+
+
+async def repaint_region(
+    *,
+    source_mix: np.ndarray,
+    start_sample: int,
+    end_sample: int,
+    bpm: float,
+    musical_key: str,
+    style_tags: list[str],
+    lyrics_override: str,
+    seed: int,
+    inference_steps: int = 40,
+    guidance_scale: float = 7.0,
+    target_layer_role: str = "full",
+    instrument_hint: str = "",
+) -> np.ndarray:
+    """
+    Generate a repainted buffer covering [0 .. total_samples] (or matching slice)
+    with ACE-Step 1.5 regional repaint / audio2audio conditioning.
+    """
+    target_sr = settings.sample_rate
+    total_samples = int(source_mix.shape[0])
+    region_len = max(1, end_sample - start_sample)
+
+    async with model_manager.acquire(ModelType.ACE_STEP, _load_acestep_model) as pipe:
+        if settings.mock_gpu:
+            await asyncio.sleep(0.15)
+            # Synthesize fresh musical segment with requested seed & layer role
+            fresh = await asyncio.to_thread(
+                _synthesize_musical_mix,
+                total_samples,
+                target_sr,
+                bpm,
+                musical_key,
+                seed,
+                style_tags,
+                target_layer_role if target_layer_role != "full_mix" else "full",
+                instrument_hint,
+            )
+            return fresh[start_sample:end_sample]
+
+        prompt_parts = ([instrument_hint] if instrument_hint else []) + style_tags + [f"{bpm} bpm", musical_key]
+        prompt = ", ".join(p for p in prompt_parts if p)
+
+        def _run_real_repaint() -> np.ndarray:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src_path = Path(tmpdir) / "source.wav"
+                out_path = Path(tmpdir) / "repainted.wav"
+                import soundfile as sf  # type: ignore
+
+                sf.write(str(src_path), source_mix, target_sr, subtype="PCM_16")
+                pipe(
+                    audio_duration=total_samples / float(target_sr),
+                    prompt=prompt,
+                    lyrics=lyrics_override,
+                    infer_step=int(inference_steps),
+                    guidance_scale=float(guidance_scale),
+                    manual_seeds=[int(seed)],
+                    task="repaint",
+                    repaint_start=start_sample / float(target_sr),
+                    repaint_end=end_sample / float(target_sr),
+                    src_audio_path=str(src_path),
+                    save_path=str(out_path),
+                )
+                data, sr = sf.read(str(out_path), dtype="float32", always_2d=True)
+                stereo = StorageManager.ensure_stereo_float32(data)
+                if sr != target_sr:
+                    stereo = StorageManager.resample_audio(stereo, sr, target_sr)
+                seg = stereo[start_sample:end_sample]
+                if seg.shape[0] < region_len:
+                    pad = np.zeros((region_len - seg.shape[0], 2), dtype=np.float32)
+                    seg = np.concatenate([seg, pad], axis=0)
+                return seg[:region_len]
+
+        return await asyncio.to_thread(_run_real_repaint)

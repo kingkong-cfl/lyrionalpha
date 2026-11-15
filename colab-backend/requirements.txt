@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+numpy>=1.26.0
+scipy>=1.13.0
+soundfile>=0.12.1
+librosa>=0.10.2
+pedalboard>=0.9.11
+demucs>=4.0.1
+httpx>=0.27.0
+python-dotenv>=1.0.1
+# Installed inside Google Colab L4 bootstrap:
+# torch
+# torchaudio
+# ace-step (from git+https://github.com/ace-step/ACE-Step.git)

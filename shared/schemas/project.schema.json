@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lyrion.ai/schemas/project.schema.json",
+  "title": "LyrionProject",
+  "description": "Extensible sample-accurate project manifest for Lyrion AI Music Studio",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project_id",
+    "name",
+    "created_at",
+    "updated_at",
+    "grid",
+    "producer_spec",
+    "tracks",
+    "repaint_history"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "grid": {
+      "type": "object",
+      "required": [
+        "sample_rate",
+        "total_samples",
+        "duration_sec",
+        "bpm",
+        "time_signature",
+        "musical_key",
+        "beat_timestamps",
+        "beat_samples",
+        "downbeat_beat_indices"
+      ],
+      "properties": {
+        "sample_rate": { "type": "integer", "default": 44100 },
+        "total_samples": { "type": "integer", "minimum": 0 },
+        "duration_sec": { "type": "number", "minimum": 0 },
+        "bpm": { "type": "number", "exclusiveMinimum": 0 },
+        "time_signature": { "type": "string", "default": "4/4" },
+        "musical_key": { "type": "string" },
+        "beat_timestamps": {
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 }
+        },
+        "beat_samples": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "downbeat_beat_indices": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "producer_spec": {
+      "type": "object",
+      "required": [
+        "raw_prompt",
+        "style_tags",
+        "structured_lyrics",
+        "seed",
+        "guidance_scale",
+        "inference_steps"
+      ],
+      "properties": {
+        "raw_prompt": { "type": "string" },
+        "style_tags": { "type": "array", "items": { "type": "string" } },
+        "structured_lyrics": { "type": "string" },
+        "seed": { "type": "integer" },
+        "guidance_scale": { "type": "number" },
+        "inference_steps": { "type": "integer" }
+      }
+    },
+    "tracks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "track_id",
+          "name",
+          "track_type",
+          "stem_role",
+          "parent_track_id",
+          "file_rel_path",
+          "midi_rel_path",
+          "revision",
+          "sample_rate",
+          "start_sample",
+          "end_sample",
+          "muted",
+          "soloed",
+          "volume_db",
+          "pan",
+          "dsp_chain",
+          "plugin_metadata"
+        ],
+        "properties": {
+          "track_id": { "type": "string" },
+          "name": { "type": "string" },
+          "track_type": {
+            "type": "string",
+            "enum": ["audio", "stem", "midi", "mic_recording"]
+          },
+          "stem_role": {
+            "type": "string",
+            "enum": ["full_mix", "vocals", "drums", "bass", "other", "custom"]
+          },
+          "parent_track_id": { "type": ["string", "null"] },
+          "file_rel_path": { "type": ["string", "null"] },
+          "midi_rel_path": { "type": ["string", "null"] },
+          "revision": { "type": "integer", "minimum": 1 },
+          "sample_rate": { "type": "integer", "default": 44100 },
+          "start_sample": { "type": "integer", "minimum": 0 },
+          "end_sample": { "type": "integer", "minimum": 0 },
+          "muted": { "type": "boolean" },
+          "soloed": { "type": "boolean" },
+          "volume_db": { "type": "number" },
+          "pan": { "type": "number", "minimum": -1.0, "maximum": 1.0 },
+          "dsp_chain": {
+            "type": "object",
+            "required": ["eq", "compressor", "reverb"],
+            "properties": {
+              "eq": {
+                "type": "object",
+                "properties": {
+                  "low_shelf_db": { "type": "number" },
+                  "mid_gain_db": { "type": "number" },
+                  "mid_freq_hz": { "type": "number" },
+                  "high_shelf_db": { "type": "number" }
+                }
+              },
+              "compressor": {
+                "type": "object",
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "threshold_db": { "type": "number" },
+                  "ratio": { "type": "number" },
+                  "attack_ms": { "type": "number" },
+                  "release_ms": { "type": "number" }
+                }
+              },
+              "reverb": {
+                "type": "object",
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "room_size": { "type": "number" },
+                  "damping": { "type": "number" },
+                  "wet_level": { "type": "number" }
+                }
+              }
+            }
+          },
+          "plugin_metadata": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "repaint_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "repaint_id",
+          "created_at",
+          "mode",
+          "start_sample",
+          "end_sample",
+          "start_sec",
+          "end_sec",
+          "crossfade_samples",
+          "previous_revision",
+          "new_revision"
+        ],
+        "properties": {
+          "repaint_id": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "repaint_and_restem",
+              "single_track_repaint",
+              "add_instrument_layer",
+              "lego_layer"
+            ]
+          },
+          "start_sample": { "type": "integer", "minimum": 0 },
+          "end_sample": { "type": "integer", "minimum": 0 },
+          "start_sec": { "type": "number", "minimum": 0 },
+          "end_sec": { "type": "number", "minimum": 0 },
+          "crossfade_samples": { "type": "integer", "minimum": 0 },
+          "prompt_override": { "type": ["string", "null"] },
+          "lyrics_override": { "type": ["string", "null"] },
+          "target_track_id": { "type": ["string", "null"] },
+          "previous_revision": { "type": "integer" },
+          "new_revision": { "type": "integer" },
+          "previous_files": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
