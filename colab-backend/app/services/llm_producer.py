@@ -108,11 +108,11 @@ def _normalize_response(
 ) -> ProducerEnhanceResponse:
     bpm = float(parsed.get("bpm", 120.0))
     bpm = max(50.0, min(220.0, bpm))
-    duration = float(preferred_duration or parsed.get("duration_sec", 24.0))
+    duration = float(preferred_duration or parsed.get("duration_sec", 30.0))
     duration = max(8.0, min(240.0, duration))
     tags_raw = parsed.get("style_tags") or ["electronic", "melodic", "studio mix"]
     tags = [str(t).strip() for t in tags_raw if str(t).strip()][:10]
-    lyrics = str(parsed.get("structured_lyrics") or "[Intro]\n(Instrumental groove)\n\n[Chorus]\nEchoes in the neon light")
+    lyrics = str(parsed.get("structured_lyrics") or "[Verse 1]\nNeon shadows move across the floor\n\n[Chorus]\nEchoes in the neon light")
     return ProducerEnhanceResponse(
         provider=provider,
         bpm=round(bpm, 1),
@@ -175,9 +175,8 @@ def _deterministic_fallback(raw_prompt: str, preferred_duration: float | None) -
 
     theme = raw_prompt.strip().rstrip(".")
     lyrics = (
-        f"[Intro]\n(Atmospheric texture inspired by: {theme})\n\n"
         f"[Verse 1]\nMoving through the static as the skyline fades to gold\n"
-        f"Every beat is counting out the stories left untold\n\n"
+        f"Every beat is counting out the stories of {theme or 'tonight'}\n\n"
         f"[Chorus]\nTurn the signal higher in the midnight glow\n"
         f"Riding on the rhythm where the bright waves flow\n\n"
         f"[Bridge]\nHold the chord suspended till the silence breaks apart\n\n"
@@ -189,7 +188,7 @@ def _deterministic_fallback(raw_prompt: str, preferred_duration: float | None) -
         bpm=bpm,
         musical_key=key,
         time_signature="4/4",
-        duration_sec=float(preferred_duration or 24.0),
+        duration_sec=float(preferred_duration or 30.0),
         style_tags=tags[:8],
         structured_lyrics=lyrics,
     )

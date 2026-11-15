@@ -71,16 +71,22 @@ export class StudioAudioEngine {
     return this.nodes.get(trackId)?.waveform ?? null;
   }
 
-  public async loadProjectTracks(baseUrl: string, project: ProjectSchema): Promise<void> {
+  public async loadProjectTracks(
+    baseUrl: string,
+    project: ProjectSchema,
+    onProgress?: (loaded: number, total: number) => void
+  ): Promise<void> {
     const reqId = ++this.loadRequestId;
     const audioTracks = project.tracks.filter((t) => Boolean(t.file_rel_path));
     if (audioTracks.length === 0) {
       this.disposeAll();
       this.loadedProjectId = project.project_id;
       this.isReady = false;
+      onProgress?.(0, 0);
       return;
     }
 
+    const totalCount = audioTracks.length;
     const sameProject = this.loadedProjectId === project.project_id;
     const desiredUrls = new Map<string, string>();
     for (const track of audioTracks) {
@@ -100,6 +106,7 @@ export class StudioAudioEngine {
       });
 
     if (allMatch) {
+      onProgress?.(totalCount, totalCount);
       this.syncMixerParams(audioTracks);
       return;
     }
@@ -111,6 +118,9 @@ export class StudioAudioEngine {
       return !existing || existing.url !== desiredUrls.get(track.track_id);
     });
 
+    let loadedCount = totalCount - tracksToFetch.length;
+    onProgress?.(loadedCount, totalCount);
+
     const fetchedBuffers = await Promise.all(
       tracksToFetch.map(async (track) => {
         const url = desiredUrls.get(track.track_id)!;
@@ -121,6 +131,10 @@ export class StudioAudioEngine {
             (err) => reject(new Error(`Failed loading ${track.name}: ${String(err)}`))
           );
         });
+        if (reqId === this.loadRequestId) {
+          loadedCount += 1;
+          onProgress?.(loadedCount, totalCount);
+        }
         return { track, url, buffer };
       })
     );

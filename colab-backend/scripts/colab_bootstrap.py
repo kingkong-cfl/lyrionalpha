@@ -1,10 +1,15 @@
 """
 Single-cell Google Colab L4 bootstrap script for Lyrion AI Music Studio.
 
-Usage inside a Google Colab notebook cell (Runtime -> L4 GPU):
-    !git clone <your-repo-url> /content/lyrion || true
+Usage inside Google Colab notebook cells (Runtime -> L4 GPU):
+    # Cell 1: Mount Drive inside the IPython kernel first
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=False)
+
+    # Cell 2: Clone repo & run bootstrap via %run (or !python if Drive is already mounted)
+    !git clone https://github.com/kingkong-cfl/lyrionalpha.git /content/lyrion || true
     %cd /content/lyrion/colab-backend
-    !python scripts/colab_bootstrap.py
+    %run scripts/colab_bootstrap.py
 """
 
 from __future__ import annotations
@@ -33,12 +38,26 @@ def mount_google_drive() -> Path:
                 from google.colab import drive  # type: ignore
 
                 drive.mount(str(drive_mount), force_remount=False)
-            except ImportError:
-                print("[Bootstrap] google.colab not detected; using local ./data directory.")
-                return Path.cwd() / "data" / "AIMusicStudio"
-        target = drive_mount / "MyDrive" / "AIMusicStudio"
-        target.mkdir(parents=True, exist_ok=True)
-        return target
+            except (ImportError, AttributeError, Exception) as exc:
+                print(
+                    "[Bootstrap] WARNING: Could not auto-mount Google Drive "
+                    f"({type(exc).__name__}: {exc}). Mount Drive in a notebook cell first via "
+                    "`from google.colab import drive; drive.mount('/content/drive')` or run via "
+                    "`%run scripts/colab_bootstrap.py`. Falling back to local ./data/AIMusicStudio.",
+                    flush=True,
+                )
+                fallback = Path.cwd() / "data" / "AIMusicStudio"
+                fallback.mkdir(parents=True, exist_ok=True)
+                return fallback
+        if (drive_mount / "MyDrive").exists():
+            target = drive_mount / "MyDrive" / "AIMusicStudio"
+            target.mkdir(parents=True, exist_ok=True)
+            return target
+        print(
+            "[Bootstrap] WARNING: /content/drive/MyDrive still unavailable; "
+            "falling back to local ./data/AIMusicStudio.",
+            flush=True,
+        )
     target = Path.cwd() / "data" / "AIMusicStudio"
     target.mkdir(parents=True, exist_ok=True)
     return target
@@ -64,11 +83,17 @@ def install_dependencies() -> None:
         existing_pp = probe_env.get("PYTHONPATH", "")
         probe_env["PYTHONPATH"] = f"{ACESTEP_REPO_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ACESTEP_REPO_DIR)
 
+    smoke_cmd = (
+        "from diffusers.models import AutoencoderOobleck; "
+        "from transformers import AutoModel; "
+        "from acestep.handler import AceStepHandler; "
+        "from acestep.inference import generate_music"
+    )
     check_ace = subprocess.run(
-        [sys.executable, "-c", "import acestep"],
+        [sys.executable, "-c", smoke_cmd],
         env=probe_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
     )
     if check_ace.returncode != 0:
         print("[Bootstrap] Cloning & installing ACE-Step 1.5 (preserving Colab PyTorch/CUDA)...")
@@ -78,9 +103,12 @@ def install_dependencies() -> None:
                 check=False,
             )
         run(
-            f"{sys.executable} -m pip install -q "
-            "transformers diffusers accelerate einops loguru diskcache "
-            "vector-quantize-pytorch numba huggingface_hub safetensors omegaconf",
+            f'{sys.executable} -m pip install -q '
+            '"transformers>=4.51.0,<4.58.0" '
+            '"diffusers>=0.35.0" '
+            '"huggingface-hub>=0.34.0,<1.0" '
+            '"vector-quantize-pytorch>=1.27.15" '
+            'accelerate einops loguru diskcache numba safetensors omegaconf',
             check=False,
         )
         nano_vllm_dir = ACESTEP_REPO_DIR / "acestep" / "third_parts" / "nano-vllm"
@@ -102,16 +130,17 @@ def install_dependencies() -> None:
                 )
 
         verify_ace = subprocess.run(
-            [sys.executable, "-c", "import acestep"],
+            [sys.executable, "-c", smoke_cmd],
             env=probe_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
         )
         if verify_ace.returncode != 0:
+            err_detail = (verify_ace.stderr or verify_ace.stdout or "").strip()
             print(
-                "[Bootstrap] WARNING: 'acestep' failed to import after install! "
-                "Real GPU generation/repaint will fail unless ACE-Step 1.5 is installed manually "
-                "(or set MOCK_GPU=true).",
+                "[Bootstrap] WARNING: ACE-Step 1.5 smoke import failed after install! "
+                "Real GPU generation/repaint may fail unless resolved (or set MOCK_GPU=true).\n"
+                f"[Bootstrap] Import stderr:\n{err_detail}",
                 flush=True,
             )
 

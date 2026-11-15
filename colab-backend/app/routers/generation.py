@@ -135,6 +135,7 @@ async def trigger_generate_song(project_id: str, req: GenerateSongRequest) -> Jo
             seed=req.seed,
             guidance_scale=req.guidance_scale,
             inference_steps=req.inference_steps,
+            shift=req.shift,
         )
 
         total_samples = int(master_audio.shape[0])
@@ -209,6 +210,7 @@ async def trigger_generate_song(project_id: str, req: GenerateSongRequest) -> Jo
                 seed=req.seed,
                 guidance_scale=req.guidance_scale,
                 inference_steps=req.inference_steps,
+                shift=req.shift,
             )
             proj.tracks = tracks
             proj.repaint_history = []
@@ -277,8 +279,9 @@ async def trigger_repaint_region(project_id: str, req: RepaintRegionRequest) -> 
             style_tags=tags,
             lyrics_override=lyrics,
             seed=seed,
-            inference_steps=proj.producer_spec.inference_steps,
-            guidance_scale=proj.producer_spec.guidance_scale,
+            inference_steps=req.inference_steps,
+            guidance_scale=req.guidance_scale,
+            shift=req.shift,
             target_layer_role="full",
         )
 
@@ -424,8 +427,9 @@ async def trigger_single_track_repaint(project_id: str, req: SingleTrackRepaintR
             style_tags=tags,
             lyrics_override=lyrics,
             seed=seed,
-            inference_steps=proj.producer_spec.inference_steps,
-            guidance_scale=proj.producer_spec.guidance_scale,
+            inference_steps=req.inference_steps,
+            guidance_scale=req.guidance_scale,
+            shift=req.shift,
             target_layer_role=t_track.stem_role,
             instrument_hint=req.prompt_override or t_track.name,
         )
@@ -556,8 +560,9 @@ async def trigger_add_instrument_layer(project_id: str, req: AddInstrumentLayerR
             style_tags=tags,
             lyrics_override="",
             seed=seed,
-            inference_steps=proj.producer_spec.inference_steps,
-            guidance_scale=proj.producer_spec.guidance_scale,
+            inference_steps=req.inference_steps,
+            guidance_scale=req.guidance_scale,
+            shift=req.shift,
             target_layer_role="custom",
             instrument_hint=req.instrument_prompt,
         )
@@ -680,6 +685,9 @@ async def trigger_lego_layer(project_id: str, req: LegoLayerRequest) -> JobCreat
             style_tags=tags,
             lyrics_override=proj.producer_spec.structured_lyrics,
             seed=seed,
+            inference_steps=req.inference_steps,
+            guidance_scale=req.guidance_scale,
+            shift=req.shift,
             target_layer_role=req.target_stem_role,
         )
 

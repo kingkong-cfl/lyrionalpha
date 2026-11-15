@@ -82,8 +82,9 @@ class ProducerSpecSchema(BaseModel):
     style_tags: list[str] = Field(default_factory=list)
     structured_lyrics: str = ""
     seed: int = 421337
-    guidance_scale: float = 7.0
-    inference_steps: int = 40
+    guidance_scale: float = 1.0
+    inference_steps: int = 8
+    shift: float = 3.0
 
 
 class RepaintHistoryEntry(BaseModel):
@@ -165,10 +166,11 @@ class GenerateSongRequest(BaseModel):
     structured_lyrics: str = ""
     bpm: float = Field(default=120.0, gt=20.0, le=300.0)
     musical_key: str = "A minor"
-    duration_sec: float = Field(default=24.0, ge=8.0, le=240.0)
+    duration_sec: float = Field(default=30.0, ge=8.0, le=240.0)
     seed: int = 421337
-    guidance_scale: float = 7.0
-    inference_steps: int = 40
+    guidance_scale: float = 1.0
+    inference_steps: int = 8
+    shift: float = 3.0
     separate_stems: bool = True
 
 
@@ -179,6 +181,9 @@ class RepaintRegionRequest(BaseModel):
     lyrics_override: Optional[str] = None
     style_tags: Optional[list[str]] = None
     seed: Optional[int] = None
+    guidance_scale: float = 1.0
+    inference_steps: int = 8
+    shift: float = 3.0
     restem_window: bool = True
 
 
@@ -189,6 +194,9 @@ class LegoLayerRequest(BaseModel):
     end_sample: int = Field(..., gt=0)
     prompt_override: Optional[str] = None
     seed: Optional[int] = None
+    guidance_scale: float = 1.0
+    inference_steps: int = 8
+    shift: float = 3.0
 
 
 class SingleTrackRepaintRequest(BaseModel):
@@ -198,6 +206,9 @@ class SingleTrackRepaintRequest(BaseModel):
     prompt_override: Optional[str] = None
     lyrics_override: Optional[str] = None
     seed: Optional[int] = None
+    guidance_scale: float = 1.0
+    inference_steps: int = 8
+    shift: float = 3.0
 
 
 class AddInstrumentLayerRequest(BaseModel):
@@ -206,6 +217,9 @@ class AddInstrumentLayerRequest(BaseModel):
     start_sample: int = Field(..., ge=0)
     end_sample: int = Field(..., gt=0)
     seed: Optional[int] = None
+    guidance_scale: float = 1.0
+    inference_steps: int = 8
+    shift: float = 3.0
 
 
 class ExportProjectRequest(BaseModel):

@@ -312,21 +312,48 @@ def _load_acestep_model() -> Any:
             generate_music,
         )
 
-        # Load DiT only (skipping 5Hz LLMHandler to save L4 VRAM since external LLM plans lyrics/BPM/key)
+        project_root = _resolve_acestep_project_root()
         dit_handler = AceStepHandler()
         init_kwargs = _filter_kwargs(
             dit_handler.initialize_service,
             {
-                "project_root": _resolve_acestep_project_root(),
+                "project_root": project_root,
                 "config_path": os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo"),
                 "device": device,
             },
         )
         init_res = dit_handler.initialize_service(**init_kwargs)
         _check_acestep_init_result(init_res)
+
+        llm_handler = None
+        try:
+            from acestep.llm_inference import LLMHandler  # type: ignore
+
+            lm_model_path = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
+            lm_backend = os.environ.get("ACESTEP_LM_BACKEND", "pt").strip() or "pt"
+            checkpoint_dir = str(Path(project_root) / "checkpoints")
+            candidate_llm = LLMHandler()
+            llm_kwargs = _filter_kwargs(
+                candidate_llm.initialize,
+                {
+                    "checkpoint_dir": checkpoint_dir,
+                    "lm_model_path": lm_model_path,
+                    "backend": lm_backend,
+                    "device": device,
+                    "offload_to_cpu": False,
+                },
+            )
+            llm_res = candidate_llm.initialize(**llm_kwargs)
+            _check_acestep_init_result(llm_res)
+            llm_handler = candidate_llm
+        except Exception as exc:
+            logger.warning("ACE-Step 1.5 LLMHandler unavailable, continuing with DiT-only mode: %s", exc)
+            llm_handler = None
+
         return {
             "version": "1.5",
             "dit_handler": dit_handler,
+            "llm_handler": llm_handler,
             "generate_music": generate_music,
             "GenerationParams": GenerationParams,
             "GenerationConfig": GenerationConfig,
@@ -358,6 +385,7 @@ def _invoke_acestep_real_sync(
     guidance_scale: float,
     target_sr: int,
     total_samples: int,
+    shift: float = 3.0,
     src_audio: np.ndarray | None = None,
     repaint_start_sec: float = 0.0,
     repaint_end_sec: float = 0.0,
@@ -380,6 +408,8 @@ def _invoke_acestep_real_sync(
             config_cls = pipe_bundle["GenerationConfig"]
             gen_fn = pipe_bundle["generate_music"]
             dit_handler = pipe_bundle["dit_handler"]
+            llm_handler = pipe_bundle.get("llm_handler")
+            use_thinking = bool(llm_handler is not None and task_type == "text2music")
 
             param_kwargs: dict[str, Any] = {
                 "task_type": task_type,
@@ -392,7 +422,8 @@ def _invoke_acestep_real_sync(
                 "seed": int(seed),
                 "inference_steps": int(inference_steps),
                 "guidance_scale": float(guidance_scale),
-                "thinking": False,
+                "shift": float(shift),
+                "thinking": use_thinking,
             }
             if src_path is not None:
                 param_kwargs["src_audio"] = str(src_path)
@@ -406,7 +437,7 @@ def _invoke_acestep_real_sync(
                     gen_fn,
                     {
                         "dit_handler": dit_handler,
-                        "llm_handler": None,
+                        "llm_handler": llm_handler if use_thinking else None,
                         "params": params,
                         "config": config,
                         "save_dir": str(tmpdir),
@@ -467,8 +498,9 @@ async def generate_full_song(
     style_tags: list[str],
     structured_lyrics: str,
     seed: int,
-    guidance_scale: float = 7.0,
-    inference_steps: int = 40,
+    guidance_scale: float = 1.0,
+    inference_steps: int = 8,
+    shift: float = 3.0,
 ) -> tuple[np.ndarray, int]:
     """Generate a full stereo mix at canonical 44,100 Hz using ACE-Step 1.5 in bfloat16."""
     target_sr = settings.sample_rate
@@ -504,6 +536,7 @@ async def generate_full_song(
             guidance_scale=guidance_scale,
             target_sr=target_sr,
             total_samples=total_samples,
+            shift=shift,
         )
         return stereo, target_sr
 
@@ -518,8 +551,9 @@ async def repaint_region(
     style_tags: list[str],
     lyrics_override: str,
     seed: int,
-    inference_steps: int = 40,
-    guidance_scale: float = 7.0,
+    inference_steps: int = 8,
+    guidance_scale: float = 1.0,
+    shift: float = 3.0,
     target_layer_role: str = "full",
     instrument_hint: str = "",
 ) -> np.ndarray:
@@ -565,6 +599,7 @@ async def repaint_region(
             guidance_scale=guidance_scale,
             target_sr=target_sr,
             total_samples=total_samples,
+            shift=shift,
             src_audio=source_mix,
             repaint_start_sec=start_sample / float(target_sr),
             repaint_end_sec=end_sample / float(target_sr),

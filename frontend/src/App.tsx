@@ -98,6 +98,7 @@ export function App() {
   const [dspTrackId, setDspTrackId] = useState<string | null>(null);
   const [savingMix, setSavingMix] = useState(false);
   const [loadingAudio, setLoadingAudio] = useState(false);
+  const [audioLoadProgress, setAudioLoadProgress] = useState<{ loaded: number; total: number } | null>(null);
 
   const rafRef = useRef<number | null>(null);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
@@ -203,17 +204,27 @@ export function App() {
 
     let cancelled = false;
     setLoadingAudio(true);
+    setAudioLoadProgress({
+      loaded: 0,
+      total: activeProject.tracks.filter((t) => Boolean(t.file_rel_path)).length,
+    });
     audioEngine
-      .loadProjectTracks(serverUrl, activeProject)
+      .loadProjectTracks(serverUrl, activeProject, (loaded, total) => {
+        if (!cancelled) {
+          setAudioLoadProgress({ loaded, total });
+        }
+      })
       .then(() => {
         if (!cancelled) {
           audioEngine.syncMixerParams(latestTracksRef.current);
           setLoadingAudio(false);
+          setAudioLoadProgress(null);
         }
       })
       .catch((err) => {
         if (!cancelled) {
           setLoadingAudio(false);
+          setAudioLoadProgress(null);
           showToast("error", err instanceof Error ? err.message : "Audio buffer preload failed.");
         }
       });
@@ -586,7 +597,7 @@ export function App() {
   const grid = activeProject?.grid ?? {
     sample_rate: 44100,
     total_samples: 0,
-    duration_sec: 16,
+    duration_sec: 30,
     bpm: 120,
     time_signature: "4/4",
     musical_key: "A minor",
@@ -595,7 +606,7 @@ export function App() {
     downbeat_beat_indices: [],
   };
 
-  const durationSec = Math.max(grid.duration_sec || 16, 1);
+  const durationSec = Math.max(grid.duration_sec || 30, 1);
   const minPxPerSec = Math.max(10, timelineViewportWidth / durationSec);
   const effectivePxPerSec = Math.max(minPxPerSec, pixelsPerSec);
   const timelineWidthPx = Math.max(
@@ -710,7 +721,7 @@ export function App() {
                 <div className="flex items-center gap-3">
                   <span className="font-mono text-[10px] text-cyan-300/90">
                     {loadingAudio
-                      ? "Preloading Web Audio buffers (Promise.all)..."
+                      ? `Preloading Web Audio buffers (${audioLoadProgress ? `${audioLoadProgress.loaded}/${audioLoadProgress.total}` : "..."})...`
                       : "Drag across any waveform or ruler to select a region"}
                   </span>
                   {!selection && (

@@ -88,6 +88,16 @@ class ModelManager:
 
     def _unload_current(self) -> None:
         if self._active_model is not None:
+            if isinstance(self._active_model, dict):
+                for val in list(self._active_model.values()):
+                    if val is not None and not isinstance(val, (type, str, bytes, int, float, bool)):
+                        for attr in ("model", "llm", "vae", "text_encoder", "dcae", "vocoder"):
+                            if hasattr(val, attr):
+                                try:
+                                    setattr(val, attr, None)
+                                except Exception:
+                                    pass
+                self._active_model.clear()
             del self._active_model
             self._active_model = None
         if self._active_type != ModelType.NONE:

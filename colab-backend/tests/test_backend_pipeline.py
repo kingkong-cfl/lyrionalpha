@@ -695,6 +695,195 @@ class BackendPipelineTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _check_acestep_init_result(("Missing checkpoint", False))
 
+    def test_07_live_l4_quality_notebook_and_tempo_fixes(self):
+        import json
+        from dataclasses import dataclass
+        from types import SimpleNamespace
+
+        import numpy as np
+        from scipy.io import wavfile
+
+        from app.schemas import (
+            AddInstrumentLayerRequest,
+            GenerateSongRequest,
+            LegoLayerRequest,
+            RepaintRegionRequest,
+            SingleTrackRepaintRequest,
+        )
+        from app.services.beat_service import _correct_octave_tempo
+
+        # 1. ACE-Step 1.5 turbo defaults (steps=8, guidance=1.0, shift=3.0, duration=30.0)
+        gen_req = GenerateSongRequest()
+        self.assertEqual(gen_req.inference_steps, 8)
+        self.assertAlmostEqual(gen_req.guidance_scale, 1.0, places=5)
+        self.assertAlmostEqual(gen_req.shift, 3.0, places=5)
+        self.assertAlmostEqual(gen_req.duration_sec, 30.0, places=5)
+
+        spec = ProducerSpecSchema()
+        self.assertEqual(spec.inference_steps, 8)
+        self.assertAlmostEqual(spec.guidance_scale, 1.0, places=5)
+        self.assertAlmostEqual(spec.shift, 3.0, places=5)
+
+        rep_req = RepaintRegionRequest(start_sample=0, end_sample=44100)
+        single_req = SingleTrackRepaintRequest(target_track_id="trk_vocals_01", start_sample=0, end_sample=44100)
+        add_req = AddInstrumentLayerRequest(
+            track_name="Synth Lead", instrument_prompt="analog lead", start_sample=0, end_sample=44100
+        )
+        lego_req = LegoLayerRequest(reference_track_id="trk_master_01", start_sample=0, end_sample=44100)
+        for r in (rep_req, single_req, add_req, lego_req):
+            self.assertEqual(r.inference_steps, 8)
+            self.assertAlmostEqual(r.guidance_scale, 1.0, places=5)
+            self.assertAlmostEqual(r.shift, 3.0, places=5)
+
+        # 2. LLMHandler thinking=True on text2music, thinking=False & llm_handler=None on repaint, shift=3.0 forwarded
+        sr = 44100
+        n = sr // 4
+        t = np.linspace(0.0, 0.25, n, endpoint=False, dtype=np.float32)
+        orig = np.zeros((n, 2), dtype=np.float32)
+        captured: list[dict[str, object]] = []
+        sentinel_llm = object()
+
+        @dataclass
+        class FakeTurboParams:
+            task_type: str
+            caption: str
+            lyrics: str
+            bpm: int
+            keyscale: str
+            duration: float
+            seed: int
+            inference_steps: int
+            guidance_scale: float
+            shift: float = 1.0
+            thinking: bool = False
+            src_audio: str | None = None
+            repainting_start: float = 0.0
+            repainting_end: float = 0.0
+
+        @dataclass
+        class FakeTurboConfig:
+            batch_size: int = 1
+            audio_format: str = "wav"
+
+        @dataclass
+        class FakeTurboResult:
+            success: bool
+            audios: list[dict[str, str]]
+
+        def fake_turbo_generate(dit_handler, llm_handler, params, config, save_dir):
+            captured.append(
+                {
+                    "task_type": params.task_type,
+                    "llm_is_sentinel": llm_handler is sentinel_llm,
+                    "llm_is_none": llm_handler is None,
+                    "thinking": params.thinking,
+                    "shift": params.shift,
+                    "steps": params.inference_steps,
+                    "guidance": params.guidance_scale,
+                }
+            )
+            out_wav = Path(save_dir) / f"{params.task_type}_{params.seed}.wav"
+            fake_audio = np.stack(
+                [0.2 * np.sin(2.0 * np.pi * 330.0 * t), 0.2 * np.sin(2.0 * np.pi * 330.0 * t)],
+                axis=1,
+            ).astype(np.float32)
+            wavfile.write(str(out_wav), sr, fake_audio)
+            return FakeTurboResult(success=True, audios=[{"path": str(out_wav)}])
+
+        turbo_bundle = {
+            "version": "1.5",
+            "dit_handler": object(),
+            "llm_handler": sentinel_llm,
+            "generate_music": fake_turbo_generate,
+            "GenerationParams": FakeTurboParams,
+            "GenerationConfig": FakeTurboConfig,
+        }
+
+        _invoke_acestep_real_sync(
+            turbo_bundle,
+            task_type="text2music",
+            prompt="synthwave, 120 bpm, A minor",
+            lyrics="[Verse 1]\nNeon",
+            bpm=120.0,
+            musical_key="A minor",
+            duration_sec=0.25,
+            seed=42,
+            inference_steps=8,
+            guidance_scale=1.0,
+            shift=3.0,
+            target_sr=sr,
+            total_samples=n,
+        )
+        _invoke_acestep_real_sync(
+            turbo_bundle,
+            task_type="repaint",
+            prompt="synthwave, 120 bpm, A minor",
+            lyrics="[Chorus]\nGlow",
+            bpm=120.0,
+            musical_key="A minor",
+            duration_sec=0.25,
+            seed=43,
+            inference_steps=8,
+            guidance_scale=1.0,
+            shift=3.0,
+            target_sr=sr,
+            total_samples=n,
+            src_audio=orig,
+            repaint_start_sec=0.05,
+            repaint_end_sec=0.20,
+        )
+
+        self.assertEqual(len(captured), 2)
+        self.assertTrue(captured[0]["llm_is_sentinel"])
+        self.assertTrue(captured[0]["thinking"])
+        self.assertAlmostEqual(float(captured[0]["shift"]), 3.0, places=5)
+        self.assertEqual(captured[0]["steps"], 8)
+        self.assertAlmostEqual(float(captured[0]["guidance"]), 1.0, places=5)
+
+        self.assertTrue(captured[1]["llm_is_none"])
+        self.assertFalse(captured[1]["thinking"])
+        self.assertAlmostEqual(float(captured[1]["shift"]), 3.0, places=5)
+
+        # 3. model_manager._unload_current clears inner dict references cleanly
+        fake_dit = SimpleNamespace(model=object(), vae=object(), text_encoder=object())
+        fake_llm = SimpleNamespace(llm=object(), model=object())
+        fake_dict_bundle = {"dit_handler": fake_dit, "llm_handler": fake_llm}
+        model_manager._active_model = fake_dict_bundle
+        model_manager._active_type = ModelType.ACE_STEP
+        model_manager._unload_current()
+        self.assertIsNone(model_manager._active_model)
+        self.assertEqual(model_manager._active_type, ModelType.NONE)
+        self.assertEqual(len(fake_dict_bundle), 0)
+        self.assertIsNone(fake_dit.model)
+        self.assertIsNone(fake_dit.vae)
+        self.assertIsNone(fake_llm.llm)
+
+        # 4. _correct_octave_tempo fixes half-tempo & double-tempo detections
+        doubled_bpm, doubled_beats = _correct_octave_tempo(
+            59.4, [0.0, 1.01, 2.02, 3.03], target_bpm=120.0, duration_sec=4.0
+        )
+        self.assertAlmostEqual(doubled_bpm, 118.8, places=2)
+        self.assertGreaterEqual(len(doubled_beats), 7)
+        self.assertAlmostEqual(doubled_beats[1], 0.505, places=3)
+
+        halved_bpm, halved_beats = _correct_octave_tempo(
+            180.0, [0.0, 0.333333, 0.666667, 1.0, 1.333333], target_bpm=90.0, duration_sec=2.0
+        )
+        self.assertAlmostEqual(halved_bpm, 90.0, places=2)
+        self.assertEqual(len(halved_beats), 3)
+
+        # 5. Lyrion_Colab_L4.ipynb is valid JSON (nbformat 4) with 3 ordered code cells
+        nb_path = Path(__file__).resolve().parents[2] / "Lyrion_Colab_L4.ipynb"
+        self.assertTrue(nb_path.is_file())
+        nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
+        self.assertEqual(nb_data.get("nbformat"), 4)
+        code_cells = [c for c in nb_data.get("cells", []) if c.get("cell_type") == "code"]
+        self.assertEqual(len(code_cells), 3)
+        cell_texts = ["\n".join(c.get("source", [])) for c in code_cells]
+        self.assertIn("drive.mount", cell_texts[0])
+        self.assertIn("kingkong-cfl/lyrionalpha", cell_texts[1])
+        self.assertIn("%run scripts/colab_bootstrap.py", cell_texts[2])
+
 
 if __name__ == "__main__":
     unittest.main()

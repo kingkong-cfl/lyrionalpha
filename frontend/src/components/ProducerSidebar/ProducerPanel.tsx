@@ -47,11 +47,11 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
     "synthwave, retrowave, analog bass, expressive vocals, wide stereo"
   );
   const [structuredLyrics, setStructuredLyrics] = useState(
-    "[Intro]\n(Warm analog arpeggio)\n\n[Verse 1]\nStreetlights blur across the midnight glass\nCounting down the miles as shadows pass\n\n[Chorus]\nOut on the neon horizon we run\nChasing the pulse till the rising sun"
+    "[Verse 1]\nStreetlights blur across the midnight glass\nCounting down the miles as shadows pass\n\n[Chorus]\nOut on the neon horizon we run\nChasing the pulse till the rising sun"
   );
   const [bpm, setBpm] = useState(120);
   const [musicalKey, setMusicalKey] = useState("A minor");
-  const [durationSec, setDurationSec] = useState(16);
+  const [durationSec, setDurationSec] = useState(30);
   const [seed, setSeed] = useState(421337);
   const [separateStems, setSeparateStems] = useState(true);
   const [providerBadge, setProviderBadge] = useState<string | null>(null);
