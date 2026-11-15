@@ -28,7 +28,12 @@ from app.routers.generation import (  # noqa: E402
 )
 from app.routers.projects import merge_track_mixer_updates  # noqa: E402
 from app.schemas import ProducerSpecSchema, ProjectSchema, TrackSchema  # noqa: E402
-from app.services.acestep_service import _invoke_acestep_real_sync, _synthesize_musical_mix  # noqa: E402
+from app.services.acestep_service import (  # noqa: E402
+    _check_acestep_init_result,
+    _invoke_acestep_real_sync,
+    _resolve_acestep_project_root,
+    _synthesize_musical_mix,
+)
 from app.services.beat_service import analyze_beat_grid  # noqa: E402
 from app.services.demucs_service import _mock_separate_stems  # noqa: E402
 from app.services.dsp_service import export_project_audio, process_track_dsp  # noqa: E402
@@ -675,6 +680,20 @@ class BackendPipelineTest(unittest.TestCase):
         self.assertTrue(captured_calls[1]["src_exists"])
         self.assertAlmostEqual(float(captured_calls[1]["repainting_start"]), 0.05, places=4)
         self.assertAlmostEqual(float(captured_calls[1]["repainting_end"]), 0.20, places=4)
+
+        # 4. ACE-Step 1.5 project_root fallback & (status_msg, success) validation
+        prev_root = os.environ.pop("ACESTEP_PROJECT_ROOT", None)
+        try:
+            resolved_root = _resolve_acestep_project_root()
+            self.assertTrue(bool(resolved_root))
+            self.assertTrue(Path(resolved_root).is_dir())
+        finally:
+            if prev_root is not None:
+                os.environ["ACESTEP_PROJECT_ROOT"] = prev_root
+
+        _check_acestep_init_result(("Ready", True))
+        with self.assertRaises(RuntimeError):
+            _check_acestep_init_result(("Missing checkpoint", False))
 
 
 if __name__ == "__main__":

@@ -282,6 +282,21 @@ def _read_and_fit_stereo(audio_path: Path, target_sr: int, total_samples: int) -
     return np.ascontiguousarray(stereo, dtype=np.float32)
 
 
+def _resolve_acestep_project_root() -> str:
+    explicit = os.environ.get("ACESTEP_PROJECT_ROOT", "").strip()
+    if explicit:
+        return explicit
+    colab_dir = Path("/content/ACE-Step-1.5")
+    if colab_dir.is_dir():
+        return str(colab_dir)
+    return os.getcwd()
+
+
+def _check_acestep_init_result(init_res: Any) -> None:
+    if isinstance(init_res, tuple) and len(init_res) >= 2 and init_res[1] is False:
+        raise RuntimeError(f"ACE-Step 1.5 initialize_service failed: {init_res[0]}")
+
+
 def _load_acestep_model() -> Any:
     if settings.mock_gpu:
         return {"backend": "mock_acestep_1_5", "dtype": "bfloat16"}
@@ -302,12 +317,13 @@ def _load_acestep_model() -> Any:
         init_kwargs = _filter_kwargs(
             dit_handler.initialize_service,
             {
-                "project_root": os.environ.get("ACESTEP_PROJECT_ROOT", ""),
+                "project_root": _resolve_acestep_project_root(),
                 "config_path": os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo"),
                 "device": device,
             },
         )
-        dit_handler.initialize_service(**init_kwargs)
+        init_res = dit_handler.initialize_service(**init_kwargs)
+        _check_acestep_init_result(init_res)
         return {
             "version": "1.5",
             "dit_handler": dit_handler,

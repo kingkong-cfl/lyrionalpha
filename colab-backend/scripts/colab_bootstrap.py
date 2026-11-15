@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+ACESTEP_REPO_DIR = Path("/content/ACE-Step-1.5")
+
 
 def run(cmd: str, check: bool = True) -> None:
     print(f"[Bootstrap] $ {cmd}", flush=True)
@@ -56,37 +58,58 @@ def install_dependencies() -> None:
     print("[Bootstrap] Installing Python backend packages...")
     run(f"{sys.executable} -m pip install -q -r requirements.txt")
 
-    # Install ACE-Step 1.5 if missing (with v1 fallback if upstream 1.5 package name unavailable)
+    # Install ACE-Step 1.5 without letting its pyproject cu128/uv-path pins break Colab PyTorch
+    probe_env = os.environ.copy()
+    if ACESTEP_REPO_DIR.exists():
+        existing_pp = probe_env.get("PYTHONPATH", "")
+        probe_env["PYTHONPATH"] = f"{ACESTEP_REPO_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ACESTEP_REPO_DIR)
+
     check_ace = subprocess.run(
         [sys.executable, "-c", "import acestep"],
+        env=probe_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     if check_ace.returncode != 0:
-        print("[Bootstrap] Installing ACE-Step 1.5 from GitHub...")
+        print("[Bootstrap] Cloning & installing ACE-Step 1.5 (preserving Colab PyTorch/CUDA)...")
+        if not ACESTEP_REPO_DIR.exists():
+            run(
+                f"git clone --depth 1 https://github.com/ACE-Step/ACE-Step-1.5.git {ACESTEP_REPO_DIR}",
+                check=False,
+            )
         run(
-            f"{sys.executable} -m pip install -q git+https://github.com/ACE-Step/ACE-Step-1.5.git",
+            f"{sys.executable} -m pip install -q "
+            "transformers diffusers accelerate einops loguru diskcache "
+            "vector-quantize-pytorch numba huggingface_hub safetensors omegaconf",
             check=False,
         )
+        nano_vllm_dir = ACESTEP_REPO_DIR / "acestep" / "third_parts" / "nano-vllm"
+        if nano_vllm_dir.exists():
+            run(
+                f"{sys.executable} -m pip install -q --no-deps --ignore-requires-python -e {nano_vllm_dir}",
+                check=False,
+            )
+        if ACESTEP_REPO_DIR.exists():
+            run(
+                f"{sys.executable} -m pip install -q --no-deps --ignore-requires-python -e {ACESTEP_REPO_DIR}",
+                check=False,
+            )
+            (ACESTEP_REPO_DIR / "checkpoints").mkdir(parents=True, exist_ok=True)
+            existing_pp = probe_env.get("PYTHONPATH", "")
+            if str(ACESTEP_REPO_DIR) not in existing_pp:
+                probe_env["PYTHONPATH"] = (
+                    f"{ACESTEP_REPO_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ACESTEP_REPO_DIR)
+                )
+
         verify_ace = subprocess.run(
             [sys.executable, "-c", "import acestep"],
+            env=probe_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         if verify_ace.returncode != 0:
-            print("[Bootstrap] Retrying with fallback ACE-Step repository...")
-            run(
-                f"{sys.executable} -m pip install -q git+https://github.com/ace-step/ACE-Step.git",
-                check=False,
-            )
-            verify_ace = subprocess.run(
-                [sys.executable, "-c", "import acestep"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        if verify_ace.returncode != 0:
             print(
-                "[Bootstrap] WARNING: 'acestep' failed to import after pip install! "
+                "[Bootstrap] WARNING: 'acestep' failed to import after install! "
                 "Real GPU generation/repaint will fail unless ACE-Step 1.5 is installed manually "
                 "(or set MOCK_GPU=true).",
                 flush=True,
@@ -132,6 +155,14 @@ def main() -> None:
 
     if Path("/content").exists():
         install_dependencies()
+
+    if ACESTEP_REPO_DIR.exists():
+        os.environ.setdefault("ACESTEP_PROJECT_ROOT", str(ACESTEP_REPO_DIR))
+        existing_pp = os.environ.get("PYTHONPATH", "")
+        if str(ACESTEP_REPO_DIR) not in existing_pp:
+            os.environ["PYTHONPATH"] = (
+                f"{ACESTEP_REPO_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ACESTEP_REPO_DIR)
+            )
 
     port = int(os.environ.get("PORT", "8000"))
     tunnel_proc, tunnel_url = start_cloudflared(port=port)
