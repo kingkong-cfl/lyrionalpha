@@ -195,7 +195,7 @@ def _deterministic_fallback(raw_prompt: str, preferred_duration: float | None) -
 
 
 async def enhance_prompt(raw_prompt: str, preferred_duration_sec: float | None = None) -> ProducerEnhanceResponse:
-    """Call Gemini (3.8-flash -> 3.5-flash-lite), fallback to Groq, then deterministic parser."""
+    """Call Gemini (2.5-flash -> 2.5-flash-lite), fallback to Groq/NIM, then deterministic parser."""
     if settings.gemini_api_key:
         for model_name in (settings.gemini_model, settings.gemini_fallback_model):
             if not model_name:

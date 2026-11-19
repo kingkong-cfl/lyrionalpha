@@ -16,6 +16,9 @@ interface LoadedTrackNode {
   lowFilter: Tone.BiquadFilter;
   midFilter: Tone.BiquadFilter;
   highFilter: Tone.BiquadFilter;
+  compressor: Tone.Compressor;
+  reverb: Tone.Reverb;
+  lastReverbDecay: number;
   channel: Tone.Channel;
   waveform: TrackWaveformData;
 }
@@ -58,17 +61,18 @@ function extractWaveformPeaks(
 
 /**
  * Multi-track Tone.Transport audio engine with strict Promise.all preloading,
- * incremental track diffing, race-safe project switching, WYSIWYG 3-band Biquad EQ,
- * and shared decoded peak extraction so WaveSurfer never double-fetches WAVs.
+ * progressive waveform availability, incremental track diffing, race-safe project
+ * switching, WYSIWYG 3-band EQ + Compressor + Reverb, and shared peak extraction.
  */
 export class StudioAudioEngine {
   private nodes: Map<string, LoadedTrackNode> = new Map();
+  private previewWaveforms: Map<string, TrackWaveformData> = new Map();
   private loadedProjectId: string | null = null;
   private isReady = false;
   private loadRequestId = 0;
 
   public getTrackWaveform(trackId: string): TrackWaveformData | null {
-    return this.nodes.get(trackId)?.waveform ?? null;
+    return this.previewWaveforms.get(trackId) ?? this.nodes.get(trackId)?.waveform ?? null;
   }
 
   public async loadProjectTracks(
@@ -111,6 +115,12 @@ export class StudioAudioEngine {
       return;
     }
 
+    if (!sameProject) {
+      this.disposeNodesOnly();
+      this.previewWaveforms.clear();
+      this.isReady = false;
+    }
+
     // Incrementally fetch ONLY new or changed track URLs
     const tracksToFetch = audioTracks.filter((track) => {
       if (!sameProject) return true;
@@ -131,11 +141,14 @@ export class StudioAudioEngine {
             (err) => reject(new Error(`Failed loading ${track.name}: ${String(err)}`))
           );
         });
+        const { peaks, duration } = extractWaveformPeaks(buffer);
+        const waveform: TrackWaveformData = { url, peaks, duration };
         if (reqId === this.loadRequestId) {
+          this.previewWaveforms.set(track.track_id, waveform);
           loadedCount += 1;
           onProgress?.(loadedCount, totalCount);
         }
-        return { track, url, buffer };
+        return { track, url, buffer, waveform };
       })
     );
 
@@ -159,9 +172,7 @@ export class StudioAudioEngine {
     }
 
     // Dispose removed or replaced track nodes without touching unchanged tracks
-    if (!sameProject) {
-      this.disposeNodesOnly();
-    } else {
+    if (sameProject) {
       for (const [trackId, node] of Array.from(this.nodes.entries())) {
         const wantedUrl = desiredUrls.get(trackId);
         if (!wantedUrl || wantedUrl !== node.url) {
@@ -173,7 +184,7 @@ export class StudioAudioEngine {
 
     transport.bpm.value = project.grid.bpm || 120;
 
-    for (const { track, url, buffer } of fetchedBuffers) {
+    for (const { track, url, buffer, waveform } of fetchedBuffers) {
       const channel = new Tone.Channel({
         volume: track.volume_db,
         pan: track.pan,
@@ -181,11 +192,32 @@ export class StudioAudioEngine {
         solo: track.soloed,
       }).toDestination();
 
+      const reverbDecay = Math.max(
+        0.35,
+        0.4 + Math.min(1, Math.max(0, track.dsp_chain.reverb.room_size)) * 3.6
+      );
+      const reverb = new Tone.Reverb({
+        decay: reverbDecay,
+        wet: track.dsp_chain.reverb.enabled
+          ? Math.min(0.85, Math.max(0, track.dsp_chain.reverb.wet_level))
+          : 0,
+      }).connect(channel);
+
+      const compEnabled = track.dsp_chain.compressor.enabled;
+      const compressor = new Tone.Compressor({
+        threshold: compEnabled
+          ? Math.max(-100, Math.min(0, track.dsp_chain.compressor.threshold_db))
+          : 0,
+        ratio: compEnabled ? Math.max(1, Math.min(20, track.dsp_chain.compressor.ratio)) : 1,
+        attack: Math.max(0.001, Math.min(1, (track.dsp_chain.compressor.attack_ms || 10) / 1000)),
+        release: Math.max(0.01, Math.min(1, (track.dsp_chain.compressor.release_ms || 100) / 1000)),
+      }).connect(reverb);
+
       const highFilter = new Tone.BiquadFilter({
         type: "highshelf",
         frequency: 4500,
         gain: track.dsp_chain.eq.high_shelf_db,
-      }).connect(channel);
+      }).connect(compressor);
 
       const midFilter = new Tone.BiquadFilter({
         type: "peaking",
@@ -207,8 +239,6 @@ export class StudioAudioEngine {
       }).connect(lowFilter);
 
       player.sync().start(0);
-      const { peaks, duration } = extractWaveformPeaks(buffer);
-      const waveform: TrackWaveformData = { url, peaks, duration };
 
       this.nodes.set(track.track_id, {
         trackId: track.track_id,
@@ -218,11 +248,15 @@ export class StudioAudioEngine {
         lowFilter,
         midFilter,
         highFilter,
+        compressor,
+        reverb,
+        lastReverbDecay: reverbDecay,
         channel,
         waveform,
       });
     }
 
+    this.previewWaveforms.clear();
     this.syncMixerParams(audioTracks);
     this.loadedProjectId = project.project_id;
     this.isReady = true;
@@ -248,11 +282,39 @@ export class StudioAudioEngine {
       node.midFilter.frequency.value = track.dsp_chain.eq.mid_freq_hz || 1000;
       node.midFilter.gain.value = track.dsp_chain.eq.mid_gain_db;
       node.highFilter.gain.value = track.dsp_chain.eq.high_shelf_db;
+
+      const compEnabled = Boolean(track.dsp_chain.compressor.enabled);
+      node.compressor.threshold.value = compEnabled
+        ? Math.max(-100, Math.min(0, track.dsp_chain.compressor.threshold_db))
+        : 0;
+      node.compressor.ratio.value = compEnabled
+        ? Math.max(1, Math.min(20, track.dsp_chain.compressor.ratio))
+        : 1;
+      node.compressor.attack.value = Math.max(
+        0.001,
+        Math.min(1, (track.dsp_chain.compressor.attack_ms || 10) / 1000)
+      );
+      node.compressor.release.value = Math.max(
+        0.01,
+        Math.min(1, (track.dsp_chain.compressor.release_ms || 100) / 1000)
+      );
+
+      const targetDecay = Math.max(
+        0.35,
+        0.4 + Math.min(1, Math.max(0, track.dsp_chain.reverb.room_size)) * 3.6
+      );
+      if (Math.abs(targetDecay - node.lastReverbDecay) > 0.05) {
+        node.reverb.decay = targetDecay;
+        node.lastReverbDecay = targetDecay;
+      }
+      node.reverb.wet.value = track.dsp_chain.reverb.enabled
+        ? Math.min(0.85, Math.max(0, track.dsp_chain.reverb.wet_level))
+        : 0;
     }
   }
 
-  public async play(loopRegion?: { startSec: number; endSec: number } | null): Promise<void> {
-    if (!this.isReady) return;
+  public async play(loopRegion?: { startSec: number; endSec: number } | null): Promise<boolean> {
+    if (!this.isReady) return false;
     await Tone.start();
     const transport = Tone.getTransport();
     if (loopRegion && loopRegion.endSec > loopRegion.startSec) {
@@ -266,6 +328,7 @@ export class StudioAudioEngine {
       transport.loop = false;
     }
     transport.start();
+    return true;
   }
 
   public pause(): void {
@@ -308,6 +371,8 @@ export class StudioAudioEngine {
       node.lowFilter.dispose();
       node.midFilter.dispose();
       node.highFilter.dispose();
+      node.compressor.dispose();
+      node.reverb.dispose();
       node.channel.dispose();
     } catch {
       // Ignore cleanup errors on disposed Web Audio nodes
@@ -323,6 +388,7 @@ export class StudioAudioEngine {
 
   public disposeAll(): void {
     this.loadRequestId++;
+    this.previewWaveforms.clear();
     const transport = Tone.getTransport();
     if (transport.state !== "stopped") {
       transport.stop();

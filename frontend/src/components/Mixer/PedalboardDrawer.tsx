@@ -128,7 +128,10 @@ export const PedalboardDrawer: React.FC<PedalboardDrawerProps> = ({
         {/* Compressor */}
         <section className="rounded-lg border border-studio-border bg-studio-bg p-3">
           <div className="mb-3 flex items-center justify-between">
-            <span className="font-semibold text-amber-300">Pedalboard Compressor</span>
+            <div>
+              <span className="font-semibold text-amber-300">Pedalboard Compressor</span>
+              <span className="ml-2 font-mono text-[10px] text-slate-500">Live Preview + Export</span>
+            </div>
             <label className="flex items-center gap-1.5 cursor-pointer">
               <input
                 type="checkbox"
@@ -182,7 +185,10 @@ export const PedalboardDrawer: React.FC<PedalboardDrawerProps> = ({
         {/* Reverb */}
         <section className="rounded-lg border border-studio-border bg-studio-bg p-3">
           <div className="mb-3 flex items-center justify-between">
-            <span className="font-semibold text-purple-300">Studio Reverb</span>
+            <div>
+              <span className="font-semibold text-purple-300">Studio Reverb</span>
+              <span className="ml-2 font-mono text-[10px] text-slate-500">Live Preview + Export</span>
+            </div>
             <label className="flex items-center gap-1.5 cursor-pointer">
               <input
                 type="checkbox"

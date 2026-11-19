@@ -174,7 +174,11 @@ def process_track_dsp(audio: np.ndarray, track: TrackSchema, sr: int = settings.
     return np.ascontiguousarray(processed, dtype=np.float32)
 
 
-def _master_bus_limit(mix: np.ndarray, normalize_lufs: bool = True) -> np.ndarray:
+def _master_bus_limit(
+    mix: np.ndarray,
+    normalize_lufs: bool = True,
+    sr: int = settings.sample_rate,
+) -> np.ndarray:
     out = mix.astype(np.float32, copy=True)
     if normalize_lufs and out.size > 0:
         rms = float(np.sqrt(np.mean(out**2)))
@@ -186,7 +190,7 @@ def _master_bus_limit(mix: np.ndarray, normalize_lufs: bool = True) -> np.ndarra
 
     if HAS_PEDALBOARD:
         limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=60.0)])
-        out = limiter(out.T, settings.sample_rate).T
+        out = limiter(out.T, sr).T
 
     peak = float(np.max(np.abs(out))) if out.size else 1.0
     if peak > 0.98:
@@ -256,7 +260,7 @@ def export_project_audio(
         proc = process_track_dsp(audio, target_track, sr)
         sliced = _slice_region_buffer(proc, start_sample, end_sample, total_samples, sr)
         # Preserve mixer fader volume_db on single-track export (only apply safety ceiling limiter)
-        rendered = _master_bus_limit(sliced, normalize_lufs=False)
+        rendered = _master_bus_limit(sliced, normalize_lufs=False, sr=sr)
         track_slug = _safe_slug(target_track.name)
         out_rel = f"exports/{project.project_id}_{track_slug}{region_tag}.wav"
         storage.write_wav(project.project_id, out_rel, rendered, sample_rate=sr)
@@ -267,15 +271,11 @@ def export_project_audio(
     for t in project.tracks:
         if not t.file_rel_path:
             continue
+        if not include_muted and t.muted:
+            continue
         if has_solo and not t.soloed:
             continue
-        if not has_solo and t.muted and not include_muted:
-            continue
         active_tracks.append(t)
-
-    # Fallback: if all stems muted, render full_mix track if present
-    if not active_tracks:
-        active_tracks = [t for t in project.tracks if t.file_rel_path][:1]
 
     master_mix = np.zeros((total_samples, 2), dtype=np.float32)
     processed_stems: list[tuple[str, np.ndarray]] = []
@@ -305,7 +305,7 @@ def export_project_audio(
             master_mix += proc
 
     sliced_master = _slice_region_buffer(master_mix, start_sample, end_sample, total_samples, sr)
-    rendered_master = _master_bus_limit(sliced_master, normalize_lufs=normalize_lufs)
+    rendered_master = _master_bus_limit(sliced_master, normalize_lufs=normalize_lufs, sr=sr)
 
     master_rel = f"exports/{project.project_id}_master{region_tag}.wav"
     storage.write_wav(project.project_id, master_rel, rendered_master, sample_rate=sr)
@@ -319,7 +319,7 @@ def export_project_audio(
             zf.write(master_abs, arcname="master_mix.wav")
             for stem_name, buf in processed_stems:
                 stem_rel = f"exports/_tmp_{stem_name}.wav"
-                stem_abs = storage.write_wav(project.project_id, stem_rel, _master_bus_limit(buf, False), sample_rate=sr)
+                stem_abs = storage.write_wav(project.project_id, stem_rel, _master_bus_limit(buf, False, sr=sr), sample_rate=sr)
                 zf.write(stem_abs, arcname=f"{stem_name}.wav")
                 stem_abs.unlink(missing_ok=True)
         return {"download_rel_path": zip_rel, "master_rel_path": master_rel}

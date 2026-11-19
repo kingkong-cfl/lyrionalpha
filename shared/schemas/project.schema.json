@@ -84,7 +84,8 @@
         "structured_lyrics": { "type": "string" },
         "seed": { "type": "integer" },
         "guidance_scale": { "type": "number" },
-        "inference_steps": { "type": "integer" }
+        "inference_steps": { "type": "integer" },
+        "shift": { "type": "number", "default": 3.0 }
       }
     },
     "tracks": {

@@ -21,7 +21,7 @@ import {
   undoLastRepaint,
 } from "./api/colabClient";
 import { audioEngine } from "./audio/AudioEngine";
-import { buildRegionFromSeconds } from "./audio/snapUtils";
+import { buildRegionFromSeconds, formatBarBeatFromTime, formatTimecode } from "./audio/snapUtils";
 import { JobStatusBanner } from "./components/JobStatusBanner";
 import { PedalboardDrawer } from "./components/Mixer/PedalboardDrawer";
 import { ProducerPanel } from "./components/ProducerSidebar/ProducerPanel";
@@ -31,6 +31,7 @@ import { TrackLane } from "./components/Timeline/TrackLane";
 import { GpuConnectionBar } from "./components/TopBar/GpuConnectionBar";
 import { TransportBar } from "./components/TopBar/TransportBar";
 import type {
+  BeatGridSchema,
   HealthResponse,
   JobStatusResponse,
   ProjectSchema,
@@ -88,7 +89,6 @@ export function App() {
   const [statusToast, setStatusToast] = useState<{ kind: "info" | "error"; text: string } | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTimeSec, setCurrentTimeSec] = useState(0);
   const [snapMode, setSnapMode] = useState<SnapMode>("bar");
   const [loopEnabled, setLoopEnabled] = useState(false);
   const [pixelsPerSec, setPixelsPerSec] = useState(85);
@@ -104,16 +104,21 @@ export function App() {
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
   const playheadRef = useRef<HTMLDivElement | null>(null);
   const rulerPlayheadRef = useRef<HTMLDivElement | null>(null);
+  const timecodeRef = useRef<HTMLDivElement | null>(null);
+  const barBeatRef = useRef<HTMLDivElement | null>(null);
   const currentTimeRef = useRef<number>(0);
   const effectivePxPerSecRef = useRef<number>(85);
   const lastClockCommitMsRef = useRef<number>(0);
   const latestTracksRef = useRef<TrackSchema[]>([]);
+  const activeProjectIdRef = useRef<string | null>(null);
+  const gridRef = useRef<BeatGridSchema | null>(null);
   const selectionRef = useRef<RegionSelection | null>(null);
 
   latestTracksRef.current = activeProject?.tracks ?? [];
+  activeProjectIdRef.current = activeProject?.project_id ?? null;
   selectionRef.current = selection;
 
-  const updatePlayheadPosition = useCallback((sec: number) => {
+  const updatePlayheadPosition = useCallback((sec: number, commitClock = true) => {
     currentTimeRef.current = sec;
     const x = Math.max(0, sec * effectivePxPerSecRef.current);
     const transform = `translate3d(${x}px, 0, 0)`;
@@ -122,6 +127,14 @@ export function App() {
     }
     if (rulerPlayheadRef.current) {
       rulerPlayheadRef.current.style.transform = transform;
+    }
+    if (commitClock) {
+      if (timecodeRef.current) {
+        timecodeRef.current.textContent = formatTimecode(sec);
+      }
+      if (barBeatRef.current && gridRef.current) {
+        barBeatRef.current.textContent = formatBarBeatFromTime(sec, gridRef.current);
+      }
     }
   }, []);
 
@@ -197,8 +210,7 @@ export function App() {
     if (!activeProject || activeProject.tracks.length === 0) {
       audioEngine.disposeAll();
       setIsPlaying(false);
-      updatePlayheadPosition(0);
-      setCurrentTimeSec(0);
+      updatePlayheadPosition(0, true);
       return;
     }
 
@@ -234,7 +246,7 @@ export function App() {
     };
   }, [trackSignature, serverUrl, apiToken, updatePlayheadPosition]);
 
-  // High-precision 60fps DOM playhead (zero React re-renders) + 10Hz throttled LCD clock
+  // High-precision 60fps DOM playhead + 20Hz direct-DOM LCD clock (zero React re-renders)
   useEffect(() => {
     const tick = () => {
       const t = audioEngine.getCurrentTimeSec();
@@ -242,16 +254,15 @@ export function App() {
       if (duration > 0 && t >= duration && audioEngine.getTransportState() === "started") {
         audioEngine.stop();
         setIsPlaying(false);
-        updatePlayheadPosition(0);
+        updatePlayheadPosition(0, true);
         lastClockCommitMsRef.current = performance.now();
-        setCurrentTimeSec(0);
       } else {
-        updatePlayheadPosition(t);
         const now = performance.now();
-        if (now - lastClockCommitMsRef.current >= 100) {
+        const shouldCommitClock = now - lastClockCommitMsRef.current >= 50;
+        if (shouldCommitClock) {
           lastClockCommitMsRef.current = now;
-          setCurrentTimeSec(t);
         }
+        updatePlayheadPosition(t, shouldCommitClock);
       }
       rafRef.current = window.requestAnimationFrame(tick);
     };
@@ -296,7 +307,16 @@ export function App() {
 
   const handleUpdateServerUrl = (nextUrl: string) => {
     const cleaned = setSavedServerUrl(nextUrl);
-    setServerUrl(cleaned);
+    if (cleaned !== serverUrl) {
+      audioEngine.disposeAll();
+      setIsPlaying(false);
+      updatePlayheadPosition(0, true);
+      setProjects([]);
+      setActiveProject(null);
+      handleSelectRegion(null);
+      setDspTrackId(null);
+      setServerUrl(cleaned);
+    }
   };
 
   const handleUpdateApiToken = (nextToken: string) => {
@@ -308,8 +328,7 @@ export function App() {
     if (!projectId) return;
     audioEngine.stop();
     setIsPlaying(false);
-    updatePlayheadPosition(0);
-    setCurrentTimeSec(0);
+    updatePlayheadPosition(0, true);
     handleSelectRegion(null);
     setDspTrackId(null);
     try {
@@ -342,10 +361,11 @@ export function App() {
   };
 
   const syncProjectIntoState = (updated: ProjectSchema, preserveMixer = true) => {
-    const normalized = normalizeReferenceMixMute(
-      updated,
-      preserveMixer ? activeProject?.tracks : undefined
-    );
+    const preservedTracks =
+      preserveMixer && activeProjectIdRef.current === updated.project_id
+        ? latestTracksRef.current
+        : undefined;
+    const normalized = normalizeReferenceMixMute(updated, preservedTracks);
     setActiveProject(normalized);
     setProjects((prev) => {
       const exists = prev.some((p) => p.project_id === normalized.project_id);
@@ -554,8 +574,10 @@ export function App() {
       audioEngine.pause();
       setIsPlaying(false);
     } else {
-      await audioEngine.play(loopEnabled && selection ? selection : null);
-      setIsPlaying(true);
+      const started = await audioEngine.play(loopEnabled && selection ? selection : null);
+      if (started) {
+        setIsPlaying(true);
+      }
     }
   };
 
@@ -565,15 +587,13 @@ export function App() {
   const handleStop = () => {
     audioEngine.stop();
     setIsPlaying(false);
-    updatePlayheadPosition(0);
-    setCurrentTimeSec(0);
+    updatePlayheadPosition(0, true);
   };
 
   const handleSeek = useCallback(
     (sec: number) => {
       audioEngine.seekToSec(sec);
-      updatePlayheadPosition(sec);
-      setCurrentTimeSec(sec);
+      updatePlayheadPosition(sec, true);
     },
     [updatePlayheadPosition]
   );
@@ -605,6 +625,7 @@ export function App() {
     beat_samples: [],
     downbeat_beat_indices: [],
   };
+  gridRef.current = grid;
 
   const durationSec = Math.max(grid.duration_sec || 30, 1);
   const minPxPerSec = Math.max(10, timelineViewportWidth / durationSec);
@@ -616,8 +637,8 @@ export function App() {
 
   useEffect(() => {
     effectivePxPerSecRef.current = effectivePxPerSec;
-    updatePlayheadPosition(currentTimeRef.current);
-  }, [effectivePxPerSec, activeProject?.project_id, updatePlayheadPosition]);
+    updatePlayheadPosition(currentTimeRef.current, true);
+  }, [effectivePxPerSec, activeProject?.project_id, grid, updatePlayheadPosition]);
 
   const handleOpenDefaultRegion = () => {
     const start = Math.min(4, Math.max(0, durationSec * 0.25));
@@ -642,7 +663,8 @@ export function App() {
 
       <TransportBar
         isPlaying={isPlaying}
-        currentTimeSec={currentTimeSec}
+        timecodeRef={timecodeRef}
+        barBeatRef={barBeatRef}
         grid={grid}
         snapMode={snapMode}
         onChangeSnapMode={setSnapMode}
@@ -661,6 +683,7 @@ export function App() {
         onExportWav={() => handleExport("wav")}
         onExportStemsZip={() => handleExport("stems_zip")}
         hasAudioTracks={Boolean(activeProject && activeProject.tracks.length > 0)}
+        loadingAudio={loadingAudio}
         busy={busy}
       />
 
@@ -782,6 +805,7 @@ export function App() {
                       onExportTrack={handleExportTrack}
                       onSeek={handleSeek}
                       onSelectRegion={handleSelectRegion}
+                      isLoadingAudio={loadingAudio}
                       busy={busy}
                     />
                   ))}

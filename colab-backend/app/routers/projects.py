@@ -92,8 +92,14 @@ def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 65536):
             yield chunk
 
 
-@router.get("/{project_id}/audio/{rel_path:path}")
-async def stream_project_audio(project_id: str, rel_path: str, request: Request) -> Response:
+def build_audio_file_response(
+    project_id: str,
+    rel_path: str,
+    request_url: str,
+    range_header: str | None,
+    preview: bool = False,
+) -> Response:
+    """Resolve project audio/export file (with optional compact preview transcoding) and Byte-Range handling."""
     try:
         file_path = storage.resolve_project_file(project_id, rel_path)
     except (ValueError, PermissionError) as exc:
@@ -102,18 +108,21 @@ async def stream_project_audio(project_id: str, rel_path: str, request: Request)
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"Audio or export file '{rel_path}' not found.")
 
-    file_size = file_path.stat().st_size
     media_type, _ = mimetypes.guess_type(str(file_path))
-    if file_path.suffix.lower() == ".wav":
+    if preview and file_path.suffix.lower() == ".wav":
+        file_path, media_type = storage.get_or_create_preview_audio(project_id, rel_path)
+    elif file_path.suffix.lower() == ".wav":
         media_type = "audio/wav"
+    elif file_path.suffix.lower() == ".flac":
+        media_type = "audio/flac"
     elif file_path.suffix.lower() == ".zip":
         media_type = "application/zip"
     media_type = media_type or "application/octet-stream"
 
-    range_header = request.headers.get("range")
+    file_size = file_path.stat().st_size
     headers = {
         "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=31536000, immutable" if "rev=" in str(request.url) else "no-cache",
+        "Cache-Control": "private, max-age=31536000, immutable" if "rev=" in request_url else "no-cache",
     }
 
     if range_header:
@@ -144,4 +153,21 @@ async def stream_project_audio(project_id: str, rel_path: str, request: Request)
         media_type=media_type,
         filename=file_path.name if file_path.suffix.lower() in (".zip", ".wav") else None,
         headers=headers,
+    )
+
+
+@router.get("/{project_id}/audio/{rel_path:path}")
+async def stream_project_audio(
+    project_id: str,
+    rel_path: str,
+    request: Request,
+    preview: bool = False,
+) -> Response:
+    return await asyncio.to_thread(
+        build_audio_file_response,
+        project_id,
+        rel_path,
+        str(request.url),
+        request.headers.get("range"),
+        preview,
     )

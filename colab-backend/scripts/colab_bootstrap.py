@@ -24,6 +24,32 @@ from pathlib import Path
 
 ACESTEP_REPO_DIR = Path("/content/ACE-Step-1.5")
 
+ACESTEP_SMOKE_CMD = (
+    "import re, transformers, diffusers, huggingface_hub; "
+    "ver = lambda s: (tuple(int(x) for x in re.findall(r'\\d+', s)[:3]) + (0, 0, 0))[:3]; "
+    "assert (4, 51, 0) <= ver(transformers.__version__) < (4, 58, 0), f'incompatible transformers=={transformers.__version__}'; "
+    "assert ver(diffusers.__version__) >= (0, 35, 0), f'incompatible diffusers=={diffusers.__version__}'; "
+    "assert (0, 34, 0) <= ver(huggingface_hub.__version__) < (1, 0, 0), f'incompatible huggingface_hub=={huggingface_hub.__version__}'; "
+    "from diffusers.models import AutoencoderOobleck; "
+    "from transformers import AutoModel; "
+    "from acestep.handler import AceStepHandler; "
+    "from acestep.inference import generate_music"
+)
+
+
+def parse_version_tuple(version_str: str) -> tuple[int, int, int]:
+    parts = [int(x) for x in re.findall(r"\d+", version_str)[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+def check_acestep_versions(transformers_v: str, diffusers_v: str, hf_v: str) -> bool:
+    t_ver = parse_version_tuple(transformers_v)
+    d_ver = parse_version_tuple(diffusers_v)
+    h_ver = parse_version_tuple(hf_v)
+    return (4, 51, 0) <= t_ver < (4, 58, 0) and d_ver >= (0, 35, 0) and (0, 34, 0) <= h_ver < (1, 0, 0)
+
 
 def run(cmd: str, check: bool = True) -> None:
     print(f"[Bootstrap] $ {cmd}", flush=True)
@@ -83,14 +109,8 @@ def install_dependencies() -> None:
         existing_pp = probe_env.get("PYTHONPATH", "")
         probe_env["PYTHONPATH"] = f"{ACESTEP_REPO_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ACESTEP_REPO_DIR)
 
-    smoke_cmd = (
-        "from diffusers.models import AutoencoderOobleck; "
-        "from transformers import AutoModel; "
-        "from acestep.handler import AceStepHandler; "
-        "from acestep.inference import generate_music"
-    )
     check_ace = subprocess.run(
-        [sys.executable, "-c", smoke_cmd],
+        [sys.executable, "-c", ACESTEP_SMOKE_CMD],
         env=probe_env,
         capture_output=True,
         text=True,
@@ -130,7 +150,7 @@ def install_dependencies() -> None:
                 )
 
         verify_ace = subprocess.run(
-            [sys.executable, "-c", smoke_cmd],
+            [sys.executable, "-c", ACESTEP_SMOKE_CMD],
             env=probe_env,
             capture_output=True,
             text=True,
@@ -145,18 +165,44 @@ def install_dependencies() -> None:
             )
 
 
+def configure_model_caches(drive_root: Path) -> None:
+    """Optionally cache HuggingFace / Torch / ACE-Step checkpoints on Drive to skip cold downloads."""
+    enabled = os.environ.get("LYRION_CACHE_MODELS_TO_DRIVE", "false").lower() in ("1", "true", "yes")
+    if not enabled or not Path("/content/drive/MyDrive").exists():
+        return
+    cache_root = drive_root / "_model_cache"
+    hf_cache = cache_root / "huggingface"
+    torch_cache = cache_root / "torch"
+    ckpt_cache = cache_root / "checkpoints"
+    hf_cache.mkdir(parents=True, exist_ok=True)
+    torch_cache.mkdir(parents=True, exist_ok=True)
+    ckpt_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(hf_cache))
+    os.environ.setdefault("TORCH_HOME", str(torch_cache))
+    if ACESTEP_REPO_DIR.exists():
+        ckpt_link = ACESTEP_REPO_DIR / "checkpoints"
+        if ckpt_link.is_dir() and not ckpt_link.is_symlink() and not any(ckpt_link.iterdir()):
+            ckpt_link.rmdir()
+        if not ckpt_link.exists() and not ckpt_link.is_symlink():
+            ckpt_link.symlink_to(ckpt_cache)
+    print(f"[Bootstrap] Persistent Drive model cache active at {cache_root}", flush=True)
+
+
 def start_cloudflared(port: int = 8000) -> tuple[subprocess.Popen[str], str]:
     log_path = Path("/tmp/cloudflared_lyrion.log")
     if log_path.exists():
         log_path.unlink()
 
     log_file = log_path.open("w", encoding="utf-8")
-    proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate"],
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate"],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        log_file.close()
 
     tunnel_url = ""
     pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
@@ -184,6 +230,7 @@ def main() -> None:
 
     if Path("/content").exists():
         install_dependencies()
+        configure_model_caches(drive_root)
 
     if ACESTEP_REPO_DIR.exists():
         os.environ.setdefault("ACESTEP_PROJECT_ROOT", str(ACESTEP_REPO_DIR))

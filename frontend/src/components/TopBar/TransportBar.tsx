@@ -10,12 +10,12 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { formatBarBeatFromTime, formatTimecode } from "../../audio/snapUtils";
 import type { BeatGridSchema, RegionSelection, SnapMode } from "../../types/project";
 
 interface TransportBarProps {
   isPlaying: boolean;
-  currentTimeSec: number;
+  timecodeRef: React.RefObject<HTMLDivElement>;
+  barBeatRef: React.RefObject<HTMLDivElement>;
   grid: BeatGridSchema;
   snapMode: SnapMode;
   onChangeSnapMode: (mode: SnapMode) => void;
@@ -34,12 +34,14 @@ interface TransportBarProps {
   onExportWav: () => void;
   onExportStemsZip: () => void;
   hasAudioTracks: boolean;
+  loadingAudio?: boolean;
   busy: boolean;
 }
 
 export const TransportBar: React.FC<TransportBarProps> = ({
   isPlaying,
-  currentTimeSec,
+  timecodeRef,
+  barBeatRef,
   grid,
   snapMode,
   onChangeSnapMode,
@@ -58,6 +60,7 @@ export const TransportBar: React.FC<TransportBarProps> = ({
   onExportWav,
   onExportStemsZip,
   hasAudioTracks,
+  loadingAudio = false,
   busy,
 }) => {
   const sliderMin = Math.max(10, Math.round(minPxPerSec));
@@ -70,10 +73,10 @@ export const TransportBar: React.FC<TransportBarProps> = ({
         <div className="flex items-center gap-1 rounded-lg border border-studio-border bg-studio-bg p-1">
           <button
             type="button"
-            disabled={!hasAudioTracks}
+            disabled={!hasAudioTracks || loadingAudio}
             onClick={onPlayPause}
             className="flex h-8 w-8 items-center justify-center rounded bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-40 transition"
-            title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+            title={loadingAudio ? "Preloading audio buffers..." : isPlaying ? "Pause (Space)" : "Play (Space)"}
           >
             {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 ml-0.5" />}
           </button>
@@ -101,18 +104,16 @@ export const TransportBar: React.FC<TransportBarProps> = ({
           </button>
         </div>
 
-        {/* LCD Readout */}
+        {/* LCD Readout (DOM-updated at 20Hz with zero React re-renders) */}
         <div className="flex items-center gap-4 rounded-lg border border-studio-border bg-studio-bg px-3.5 py-1.5 font-mono">
           <div>
             <div className="text-[9px] uppercase tracking-wider text-slate-500">Time</div>
-            <div className="text-sm font-semibold text-cyan-300">{formatTimecode(currentTimeSec)}</div>
+            <div ref={timecodeRef} className="text-sm font-semibold text-cyan-300">00:00.00</div>
           </div>
           <div className="h-6 w-px bg-studio-border" />
           <div>
             <div className="text-[9px] uppercase tracking-wider text-slate-500">Bar : Beat</div>
-            <div className="text-sm font-semibold text-slate-100">
-              {formatBarBeatFromTime(currentTimeSec, grid)}
-            </div>
+            <div ref={barBeatRef} className="text-sm font-semibold text-slate-100">1:1</div>
           </div>
           <div className="h-6 w-px bg-studio-border" />
           <div>

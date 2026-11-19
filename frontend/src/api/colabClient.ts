@@ -71,7 +71,7 @@ export function buildTrackAudioUrl(
   const cleanBase = baseUrl.replace(/\/+$/, "");
   const token = getSavedApiToken();
   const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
-  return `${cleanBase}/api/v1/projects/${encodeURIComponent(projectId)}/audio/${fileRelPath}?rev=${revision}${tokenParam}`;
+  return `${cleanBase}/api/v1/projects/${encodeURIComponent(projectId)}/audio/${fileRelPath}?rev=${revision}&preview=1${tokenParam}`;
 }
 
 export function buildDownloadAudioUrl(

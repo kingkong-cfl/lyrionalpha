@@ -884,6 +884,280 @@ class BackendPipelineTest(unittest.TestCase):
         self.assertIn("kingkong-cfl/lyrionalpha", cell_texts[1])
         self.assertIn("%run scripts/colab_bootstrap.py", cell_texts[2])
 
+    def test_08_seed_config_unload_parity_preview_and_hygiene(self):
+        import importlib.util
+        import json
+        from dataclasses import dataclass
+
+        import numpy as np
+        from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.responses import FileResponse
+        from scipy.io import wavfile
+
+        from app.config import Settings
+        from app.routers.projects import _iter_file_range, build_audio_file_response
+        from app.services.dsp_service import export_project_audio
+
+        # 1. Seed propagation via GenerationConfig(use_random_seed=False, seeds=[seed])
+        sr = 44100
+        n = sr // 4
+        t = np.linspace(0.0, 0.25, n, endpoint=False, dtype=np.float32)
+        captured_cfg: dict[str, object] = {}
+
+        @dataclass
+        class FakeParamsNoSeed:
+            task_type: str
+            caption: str
+            lyrics: str
+            bpm: int
+            keyscale: str
+            duration: float
+            inference_steps: int
+            guidance_scale: float
+            shift: float = 3.0
+            thinking: bool = False
+
+        @dataclass
+        class FakeConfigWithSeeds:
+            batch_size: int = 1
+            audio_format: str = "wav"
+            use_random_seed: bool = True
+            seeds: list[int] | None = None
+
+        @dataclass
+        class FakeResult:
+            success: bool
+            audios: list[dict[str, str]]
+
+        def fake_gen_with_cfg(dit_handler, llm_handler, params, config, save_dir):
+            captured_cfg["use_random_seed"] = config.use_random_seed
+            captured_cfg["seeds"] = list(config.seeds or [])
+            out_wav = Path(save_dir) / "seeded.wav"
+            fake_audio = np.stack(
+                [0.25 * np.sin(2.0 * np.pi * 220.0 * t), 0.25 * np.sin(2.0 * np.pi * 220.0 * t)],
+                axis=1,
+            ).astype(np.float32)
+            wavfile.write(str(out_wav), sr, fake_audio)
+            return FakeResult(success=True, audios=[{"path": str(out_wav)}])
+
+        _invoke_acestep_real_sync(
+            {
+                "version": "1.5",
+                "dit_handler": object(),
+                "generate_music": fake_gen_with_cfg,
+                "GenerationParams": FakeParamsNoSeed,
+                "GenerationConfig": FakeConfigWithSeeds,
+            },
+            task_type="text2music",
+            prompt="house groove",
+            lyrics="[Verse 1]\nLine",
+            bpm=124.0,
+            musical_key="C minor",
+            duration_sec=0.25,
+            seed=777123,
+            inference_steps=8,
+            guidance_scale=1.0,
+            shift=3.0,
+            target_sr=sr,
+            total_samples=n,
+        )
+        self.assertIs(captured_cfg["use_random_seed"], False)
+        self.assertEqual(captured_cfg["seeds"], [777123])
+
+        # 2. ModelManager._unload_current() deep cleanup (unload hook + arbitrary attrs + count)
+        class FakeHandlerWithUnload:
+            def __init__(self) -> None:
+                self.unload_called = False
+                self.dit = object()
+                self.lm_model = object()
+                self.silence_latent = np.zeros(16, dtype=np.float32)
+                self.custom_tensor = np.ones(16, dtype=np.float32)
+
+            def unload(self) -> None:
+                self.unload_called = True
+
+        handler_direct = FakeHandlerWithUnload()
+        before_count = model_manager.unload_count
+        model_manager._active_model = handler_direct
+        model_manager._active_type = ModelType.ACE_STEP
+        model_manager._unload_current()
+        self.assertTrue(handler_direct.unload_called)
+        self.assertIsNone(handler_direct.dit)
+        self.assertIsNone(handler_direct.lm_model)
+        self.assertIsNone(handler_direct.silence_latent)
+        self.assertFalse(hasattr(handler_direct, "custom_tensor"))
+        self.assertEqual(model_manager.unload_count, before_count + 1)
+
+        handler_in_dict = FakeHandlerWithUnload()
+        bundle = {"dit_handler": handler_in_dict, "arbitrary_cache": {"big": np.ones(8)}}
+        model_manager._active_model = bundle
+        model_manager._active_type = ModelType.ACE_STEP
+        model_manager._unload_current()
+        self.assertTrue(handler_in_dict.unload_called)
+        self.assertEqual(len(bundle), 0)
+        self.assertIsNone(handler_in_dict.dit)
+
+        # 3. Solo + Mute & All-Muted Export Parity (no silent Full Mix fallback)
+        proj = storage.create_project("Parity Suite", bpm=120.0, musical_key="A minor")
+        proj.grid.sample_rate = sr
+        proj.grid.total_samples = n
+        proj.grid.duration_sec = 0.25
+
+        drums_w = np.stack(
+            [0.30 * np.sin(2.0 * np.pi * 110.0 * t), 0.30 * np.sin(2.0 * np.pi * 110.0 * t)],
+            axis=1,
+        ).astype(np.float32)
+        bass_w = np.stack(
+            [0.40 * np.sin(2.0 * np.pi * 220.0 * t), 0.40 * np.sin(2.0 * np.pi * 220.0 * t)],
+            axis=1,
+        ).astype(np.float32)
+        full_w = np.full((n, 2), 0.75, dtype=np.float32)
+
+        drums_rel = _unique_wav_rel("stems", "drums", 1)
+        bass_rel = _unique_wav_rel("stems", "bass", 1)
+        full_rel = _unique_wav_rel("raw", "master_mix", 1)
+        storage.write_wav(proj.project_id, drums_rel, drums_w, sample_rate=sr)
+        storage.write_wav(proj.project_id, bass_rel, bass_w, sample_rate=sr)
+        storage.write_wav(proj.project_id, full_rel, full_w, sample_rate=sr)
+
+        def make_tracks(drums_muted: bool, drums_solo: bool, bass_muted: bool, bass_solo: bool, full_muted: bool):
+            return [
+                TrackSchema(
+                    track_id="trk_full",
+                    name="Full Mix (Reference)",
+                    track_type="audio",
+                    stem_role="full_mix",
+                    file_rel_path=full_rel,
+                    revision=1,
+                    sample_rate=sr,
+                    end_sample=n,
+                    muted=full_muted,
+                    soloed=False,
+                ),
+                TrackSchema(
+                    track_id="trk_drums",
+                    name="Drums",
+                    track_type="stem",
+                    stem_role="drums",
+                    file_rel_path=drums_rel,
+                    revision=1,
+                    sample_rate=sr,
+                    end_sample=n,
+                    muted=drums_muted,
+                    soloed=drums_solo,
+                ),
+                TrackSchema(
+                    track_id="trk_bass",
+                    name="Bass",
+                    track_type="stem",
+                    stem_role="bass",
+                    file_rel_path=bass_rel,
+                    revision=1,
+                    sample_rate=sr,
+                    end_sample=n,
+                    muted=bass_muted,
+                    soloed=bass_solo,
+                ),
+            ]
+
+        # Case A: soloed=True AND muted=True -> Mute wins -> silence
+        proj.tracks = make_tracks(drums_muted=True, drums_solo=True, bass_muted=False, bass_solo=False, full_muted=True)
+        res_a = export_project_audio(proj, export_format="wav", normalize_lufs=False)
+        aud_a, _ = storage.read_wav(proj.project_id, res_a["download_rel_path"], target_sr=sr)
+        self.assertEqual(float(np.max(np.abs(aud_a))), 0.0)
+
+        # Case B: soloed=True AND muted=False on Drums -> only Drums mixed (matches non-zero bass exclusion)
+        proj.tracks = make_tracks(drums_muted=False, drums_solo=True, bass_muted=False, bass_solo=False, full_muted=True)
+        res_b = export_project_audio(proj, export_format="wav", normalize_lufs=False)
+        aud_b, _ = storage.read_wav(proj.project_id, res_b["download_rel_path"], target_sr=sr)
+        self.assertLess(float(np.max(np.abs(aud_b - drums_w))), 1e-3)
+
+        # Case C: ALL tracks muted -> strict silence (never falls back to unmuted Full Mix)
+        proj.tracks = make_tracks(drums_muted=True, drums_solo=False, bass_muted=True, bass_solo=False, full_muted=True)
+        res_c = export_project_audio(proj, export_format="wav", normalize_lufs=False)
+        aud_c, _ = storage.read_wav(proj.project_id, res_c["download_rel_path"], target_sr=sr)
+        self.assertEqual(float(np.max(np.abs(aud_c))), 0.0)
+
+        # 4. Preview Audio Streaming (?preview=1) + Range 206 + Cache-Control: private + CORS allow_credentials=False
+        orig_path = storage.resolve_project_file(proj.project_id, drums_rel)
+        orig_size = orig_path.stat().st_size
+        preview_path, preview_mime = storage.get_or_create_preview_audio(proj.project_id, drums_rel)
+        self.assertTrue(preview_path.is_file())
+        self.assertIn(preview_mime, ("audio/flac", "audio/wav"))
+        self.assertLess(preview_path.stat().st_size, orig_size * 0.65)
+        preview_mtime = preview_path.stat().st_mtime_ns
+
+        # Second call hits cached preview file without rewriting
+        preview_path_2, _ = storage.get_or_create_preview_audio(proj.project_id, drums_rel)
+        self.assertEqual(preview_path_2, preview_path)
+        self.assertEqual(preview_path_2.stat().st_mtime_ns, preview_mtime)
+
+        decoded_preview, _ = storage.read_wav(
+            proj.project_id,
+            preview_path.relative_to(storage.project_dir(proj.project_id)).as_posix(),
+            target_sr=sr,
+        )
+        self.assertEqual(decoded_preview.shape, drums_w.shape)
+        self.assertLess(float(np.max(np.abs(decoded_preview - drums_w))), 2e-4)
+
+        preview_url = f"https://testserver/api/v1/projects/{proj.project_id}/audio/{drums_rel}?rev=1&preview=1"
+        range_resp = build_audio_file_response(
+            proj.project_id,
+            drums_rel,
+            preview_url,
+            "bytes=0-1023",
+            preview=True,
+        )
+        self.assertEqual(range_resp.status_code, 206)
+        self.assertIn("private", range_resp.headers.get("cache-control", "").lower())
+        self.assertNotIn("public", range_resp.headers.get("cache-control", "").lower())
+        self.assertIn("immutable", range_resp.headers.get("cache-control", "").lower())
+        self.assertEqual(range_resp.headers.get("content-length"), "1024")
+        self.assertEqual(len(b"".join(_iter_file_range(preview_path, 0, 1023))), 1024)
+
+        full_resp = build_audio_file_response(
+            proj.project_id,
+            drums_rel,
+            preview_url,
+            None,
+            preview=True,
+        )
+        self.assertIsInstance(full_resp, FileResponse)
+        self.assertEqual(Path(full_resp.path), preview_path)
+        self.assertIn("private", full_resp.headers.get("cache-control", "").lower())
+
+        cors_entries = [m for m in app.user_middleware if m.cls is CORSMiddleware]
+        self.assertEqual(len(cors_entries), 1)
+        self.assertIs(cors_entries[0].kwargs.get("allow_credentials"), False)
+
+        # 5. Gemini defaults, Bootstrap Version Gate & Shared Schema Shift Field
+        prev_gm = os.environ.pop("GEMINI_MODEL", None)
+        prev_gf = os.environ.pop("GEMINI_FALLBACK_MODEL", None)
+        try:
+            fresh_settings = Settings()
+            self.assertEqual(fresh_settings.gemini_model, "gemini-2.5-flash")
+            self.assertEqual(fresh_settings.gemini_fallback_model, "gemini-2.5-flash-lite")
+        finally:
+            if prev_gm is not None:
+                os.environ["GEMINI_MODEL"] = prev_gm
+            if prev_gf is not None:
+                os.environ["GEMINI_FALLBACK_MODEL"] = prev_gf
+
+        bootstrap_path = Path(__file__).resolve().parents[1] / "scripts" / "colab_bootstrap.py"
+        spec = importlib.util.spec_from_file_location("colab_bootstrap_under_test", bootstrap_path)
+        self.assertIsNotNone(spec)
+        bootstrap_mod = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(bootstrap_mod)
+        self.assertTrue(bootstrap_mod.check_acestep_versions("4.57.1", "0.35.2", "0.36.0"))
+        self.assertFalse(bootstrap_mod.check_acestep_versions("5.0.0", "0.35.2", "0.36.0"))
+        self.assertFalse(bootstrap_mod.check_acestep_versions("4.57.1", "0.35.2", "1.0.0"))
+        self.assertFalse(bootstrap_mod.check_acestep_versions("4.57.1", "0.34.0", "0.36.0"))
+
+        shared_schema_path = Path(__file__).resolve().parents[2] / "shared" / "schemas" / "project.schema.json"
+        shared_schema = json.loads(shared_schema_path.read_text(encoding="utf-8"))
+        self.assertIn("shift", shared_schema["properties"]["producer_spec"]["properties"])
+
 
 if __name__ == "__main__":
     unittest.main()

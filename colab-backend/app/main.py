@@ -79,7 +79,7 @@ async def api_token_auth_middleware(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Range", "Accept-Ranges", "Content-Length", "Content-Disposition"],

@@ -59,6 +59,15 @@ export const RepaintActionBar: React.FC<RepaintActionBarProps> = ({
   const [instrumentPrompt, setInstrumentPrompt] = useState(
     `melodic electric guitar riff, ${Math.round(grid.bpm || 120)} BPM, ${grid.musical_key}`
   );
+  const instrumentPromptEditedRef = useRef(false);
+
+  useEffect(() => {
+    if (!instrumentPromptEditedRef.current) {
+      setInstrumentPrompt(
+        `melodic electric guitar riff, ${Math.round(grid.bpm || 120)} BPM, ${grid.musical_key}`
+      );
+    }
+  }, [grid.bpm, grid.musical_key]);
 
   // Bi-directional numeric Start (s) / End (s) inputs synced with selection
   const [startDraft, setStartDraft] = useState(selection.startSec.toFixed(2));
@@ -81,7 +90,7 @@ export const RepaintActionBar: React.FC<RepaintActionBarProps> = ({
     }
   }, [tracks, targetTrackId, defaultTargetId]);
 
-  const maxDur = Math.max(0.1, grid.duration_sec || 16);
+  const maxDur = Math.max(0.1, grid.duration_sec || 30);
 
   const applyNumericRange = (
     nextStartStr: string,
@@ -271,7 +280,10 @@ export const RepaintActionBar: React.FC<RepaintActionBarProps> = ({
           <input
             type="text"
             value={instrumentPrompt}
-            onChange={(e) => setInstrumentPrompt(e.target.value)}
+            onChange={(e) => {
+              instrumentPromptEditedRef.current = true;
+              setInstrumentPrompt(e.target.value);
+            }}
             placeholder="Instrument musical prompt (e.g., melodic electric guitar riff, 120 BPM, A minor)..."
             className="flex-1 min-w-[260px] rounded-md border border-studio-border bg-studio-bg px-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:border-emerald-500 focus:outline-none"
           />

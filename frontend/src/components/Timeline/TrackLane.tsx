@@ -20,6 +20,7 @@ interface TrackLaneProps {
   onExportTrack: (trackId: string) => void;
   onSeek: (sec: number) => void;
   onSelectRegion: (region: RegionSelection | null) => void;
+  isLoadingAudio?: boolean;
   busy: boolean;
 }
 
@@ -47,6 +48,7 @@ export const TrackLane: React.FC<TrackLaneProps> = React.memo(({
   onExportTrack,
   onSeek,
   onSelectRegion,
+  isLoadingAudio = false,
   busy,
 }) => {
   const waveContainerRef = useRef<HTMLDivElement | null>(null);
@@ -58,7 +60,7 @@ export const TrackLane: React.FC<TrackLaneProps> = React.memo(({
   latestPxPerSecRef.current = pixelsPerSec;
 
   const palette = ROLE_COLORS[track.stem_role] || ROLE_COLORS.custom;
-  const durationSec = Math.max(grid.duration_sec || 16, 1);
+  const durationSec = Math.max(grid.duration_sec || 30, 1);
   const timelineWidth = Math.max(200, Math.round(timelineWidthPx));
 
   const barGridTimes = useMemo(
@@ -298,6 +300,14 @@ export const TrackLane: React.FC<TrackLaneProps> = React.memo(({
           style={{ width: `${Math.round(durationSec * pixelsPerSec)}px` }}
           className="pointer-events-none relative z-10"
         />
+
+        {!waveform && isLoadingAudio && track.file_rel_path && (
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center pl-4">
+            <span className="animate-pulse rounded bg-slate-900/80 px-2 py-0.5 font-mono text-[10px] text-cyan-300/80">
+              Downloading &amp; decoding waveform...
+            </span>
+          </div>
+        )}
 
         {/* Selected Repaint Region Overlay */}
         {selection && (

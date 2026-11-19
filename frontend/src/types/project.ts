@@ -74,6 +74,7 @@ export interface ProducerSpecSchema {
   seed: number;
   guidance_scale: number;
   inference_steps: number;
+  shift?: number;
 }
 
 export interface RepaintHistoryEntry {

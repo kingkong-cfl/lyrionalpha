@@ -431,7 +431,17 @@ def _invoke_acestep_real_sync(
                 param_kwargs["repainting_end"] = float(repaint_end_sec)
 
             params = params_cls(**_filter_kwargs(params_cls, param_kwargs))
-            config = config_cls(**_filter_kwargs(config_cls, {"batch_size": 1, "audio_format": "wav"}))
+            config = config_cls(
+                **_filter_kwargs(
+                    config_cls,
+                    {
+                        "batch_size": 1,
+                        "audio_format": "wav",
+                        "use_random_seed": False,
+                        "seeds": [int(seed)],
+                    },
+                )
+            )
             result = gen_fn(
                 **_filter_kwargs(
                     gen_fn,

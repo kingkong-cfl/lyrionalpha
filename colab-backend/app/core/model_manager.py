@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import types
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -22,7 +23,7 @@ except ImportError:  # pragma: no cover - local CPU mode
 
 class ModelType(str, Enum):
     NONE = "none"
-    ACE_STEP = "ace_step_1_5"
+    ACE_STEP = "ace_step_1_5"  # Extensible for future ACE_STEP_BASE / lego on A100
     DEMUCS = "htdemucs"
     BASIC_PITCH = "basic_pitch"
     ORPHEUS = "orpheus"
@@ -46,6 +47,60 @@ class GpuTelemetry:
     vram_total_mb: float
     active_model: str
     mock_gpu: bool
+
+
+_KNOWN_HEAVY_ATTRS = (
+    "model",
+    "llm",
+    "vae",
+    "text_encoder",
+    "dcae",
+    "vocoder",
+    "dit",
+    "lm_model",
+    "silence_latent",
+    "quantizer",
+)
+
+
+def _release_model_object(obj: Any, _seen: set[int] | None = None) -> None:
+    """Recursively detach model handlers and tensor attributes so CUDA memory can be reclaimed."""
+    if obj is None or isinstance(obj, (type, str, bytes, int, float, bool, types.ModuleType, types.FunctionType, types.BuiltinFunctionType)):
+        return
+    if _seen is None:
+        _seen = set()
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return
+    _seen.add(obj_id)
+
+    if isinstance(obj, dict):
+        for val in list(obj.values()):
+            _release_model_object(val, _seen)
+        obj.clear()
+        return
+
+    unload_fn = getattr(obj, "unload", None)
+    if callable(unload_fn):
+        try:
+            unload_fn()
+        except Exception:
+            pass
+
+    for attr in _KNOWN_HEAVY_ATTRS:
+        if hasattr(obj, attr):
+            try:
+                setattr(obj, attr, None)
+            except Exception:
+                pass
+
+    obj_dict = getattr(obj, "__dict__", None)
+    if isinstance(obj_dict, dict):
+        for key in list(obj_dict.keys()):
+            if key not in _KNOWN_HEAVY_ATTRS and not isinstance(
+                obj_dict[key], (str, bytes, int, float, bool)
+            ):
+                obj_dict.pop(key, None)
 
 
 class ModelManager:
@@ -88,16 +143,7 @@ class ModelManager:
 
     def _unload_current(self) -> None:
         if self._active_model is not None:
-            if isinstance(self._active_model, dict):
-                for val in list(self._active_model.values()):
-                    if val is not None and not isinstance(val, (type, str, bytes, int, float, bool)):
-                        for attr in ("model", "llm", "vae", "text_encoder", "dcae", "vocoder"):
-                            if hasattr(val, attr):
-                                try:
-                                    setattr(val, attr, None)
-                                except Exception:
-                                    pass
-                self._active_model.clear()
+            _release_model_object(self._active_model)
             del self._active_model
             self._active_model = None
         if self._active_type != ModelType.NONE:

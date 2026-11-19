@@ -167,6 +167,44 @@ class StorageManager:
             sr = target_sr
         return stereo, sr
 
+    def get_or_create_preview_audio(self, project_id: str, rel_path: str) -> tuple[Path, str]:
+        """Return a compact cached FLAC (or PCM16 WAV fallback) preview file for fast browser streaming."""
+        src = self.resolve_project_file(project_id, rel_path)
+        if not src.is_file():
+            raise FileNotFoundError(f"Audio file '{rel_path}' not found in project '{project_id}'.")
+        if src.suffix.lower() != ".wav":
+            return src, "application/octet-stream"
+
+        use_flac = sf is not None and "FLAC" in sf.available_formats()
+        ext = ".flac" if use_flac else ".pcm16.wav"
+        media_type = "audio/flac" if use_flac else "audio/wav"
+
+        preview_rel = (Path(".preview_cache") / f"{rel_path}{ext}").as_posix()
+        preview_path = self.resolve_project_file(project_id, preview_rel)
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if (
+            preview_path.is_file()
+            and preview_path.stat().st_size > 0
+            and preview_path.stat().st_mtime >= src.stat().st_mtime
+        ):
+            return preview_path, media_type
+
+        stereo, sr = self.read_wav(project_id, rel_path, target_sr=settings.sample_rate)
+        clipped = np.clip(stereo, -1.0, 1.0).astype(np.float32, copy=False)
+        tmp_path = preview_path.with_name(f"{preview_path.name}.{uuid.uuid4().hex[:6]}.tmp")
+        try:
+            if use_flac:
+                sf.write(str(tmp_path), clipped, sr, subtype="PCM_16", format="FLAC")
+            else:
+                pcm16 = np.round(clipped * 32767.0).astype(np.int16)
+                wavfile.write(str(tmp_path), sr, np.ascontiguousarray(pcm16))
+            os.replace(tmp_path, preview_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+        return preview_path, media_type
+
     @staticmethod
     def _pcm_to_float32(raw: np.ndarray) -> np.ndarray:
         if raw.dtype == np.int16:
