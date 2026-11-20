@@ -712,17 +712,21 @@ class BackendPipelineTest(unittest.TestCase):
         )
         from app.services.beat_service import _correct_octave_tempo
 
-        # 1. ACE-Step 1.5 turbo defaults (steps=8, guidance=1.0, shift=3.0, duration=30.0)
+        # 1. ACE-Step 1.5 turbo defaults (steps=8, guidance=1.0, shift=3.0; bpm/key/duration/seed Auto=None)
         gen_req = GenerateSongRequest()
         self.assertEqual(gen_req.inference_steps, 8)
         self.assertAlmostEqual(gen_req.guidance_scale, 1.0, places=5)
         self.assertAlmostEqual(gen_req.shift, 3.0, places=5)
-        self.assertAlmostEqual(gen_req.duration_sec, 30.0, places=5)
+        self.assertIsNone(gen_req.bpm)
+        self.assertIsNone(gen_req.musical_key)
+        self.assertIsNone(gen_req.duration_sec)
+        self.assertIsNone(gen_req.seed)
 
         spec = ProducerSpecSchema()
         self.assertEqual(spec.inference_steps, 8)
         self.assertAlmostEqual(spec.guidance_scale, 1.0, places=5)
         self.assertAlmostEqual(spec.shift, 3.0, places=5)
+        self.assertIsNone(spec.seed)
 
         rep_req = RepaintRegionRequest(start_sample=0, end_sample=44100)
         single_req = SingleTrackRepaintRequest(target_track_id="trk_vocals_01", start_sample=0, end_sample=44100)
@@ -1157,6 +1161,255 @@ class BackendPipelineTest(unittest.TestCase):
         shared_schema_path = Path(__file__).resolve().parents[2] / "shared" / "schemas" / "project.schema.json"
         shared_schema = json.loads(shared_schema_path.read_text(encoding="utf-8"))
         self.assertIn("shift", shared_schema["properties"]["producer_spec"]["properties"])
+
+    def test_09_auto_params_split_enhance_and_1_7b_lm_default(self):
+        import json
+        import sys
+        import types
+        from dataclasses import dataclass
+
+        import numpy as np
+        from pydantic import ValidationError
+        from scipy.io import wavfile
+
+        from app.schemas import GenerateSongRequest, ProducerEnhanceRequest
+        from app.services import acestep_service, beat_service
+        from app.services.acestep_service import (
+            _build_acestep_prompt,
+            _load_acestep_model,
+            _read_and_fit_stereo,
+            resolve_mock_generation_params,
+        )
+        from app.services.llm_producer import _normalize_response
+
+        # 1. GenerateSongRequest Auto (None) & bounds validation
+        auto_req = GenerateSongRequest()
+        self.assertIsNone(auto_req.bpm)
+        self.assertIsNone(auto_req.musical_key)
+        self.assertIsNone(auto_req.duration_sec)
+        self.assertIsNone(auto_req.seed)
+        with self.assertRaises(ValidationError):
+            GenerateSongRequest(duration_sec=5.0)
+        explicit_req = GenerateSongRequest(bpm=128.0, musical_key="F# minor", duration_sec=30.0, seed=99)
+        self.assertEqual(explicit_req.bpm, 128.0)
+        self.assertEqual(explicit_req.duration_sec, 30.0)
+        self.assertEqual(explicit_req.seed, 99)
+
+        # 2. _build_acestep_prompt omits Auto fields cleanly
+        self.assertEqual(_build_acestep_prompt(["synthwave", "punchy drums"], None, None), "synthwave, punchy drums")
+        self.assertEqual(
+            _build_acestep_prompt(["synthwave"], 120.0, "A minor"),
+            "synthwave, 120 bpm, A minor",
+        )
+
+        # 3. _invoke_acestep_real_sync with all Auto (None) args + natural output duration
+        sr = 44100
+        natural_samples = 16317  # ~0.37s non-standard length preserved when total_samples=None
+        captured: dict[str, object] = {}
+
+        @dataclass
+        class FakeAutoParams:
+            task_type: str
+            caption: str
+            lyrics: str
+            bpm: int | None = None
+            keyscale: str = ""
+            duration: float = -1.0
+            inference_steps: int = 8
+            guidance_scale: float = 1.0
+            shift: float = 3.0
+            thinking: bool = False
+
+        @dataclass
+        class FakeAutoConfig:
+            batch_size: int = 1
+            audio_format: str = "wav"
+            use_random_seed: bool = False
+            seeds: list[int] | None = None
+
+        @dataclass
+        class FakeResult:
+            success: bool
+            audios: list[dict[str, str]]
+
+        def fake_auto_gen(dit_handler, llm_handler, params, config, save_dir):
+            captured["bpm"] = params.bpm
+            captured["keyscale"] = params.keyscale
+            captured["duration"] = params.duration
+            captured["thinking"] = params.thinking
+            captured["llm_present"] = llm_handler is not None
+            captured["use_random_seed"] = config.use_random_seed
+            captured["seeds"] = config.seeds
+
+            out_wav = Path(save_dir) / "natural_auto.wav"
+            t = np.linspace(0.0, natural_samples / float(sr), natural_samples, endpoint=False, dtype=np.float32)
+            audio = np.stack([0.2 * np.sin(2 * np.pi * 220 * t), 0.2 * np.sin(2 * np.pi * 220 * t)], axis=1).astype(
+                np.float32
+            )
+            wavfile.write(str(out_wav), sr, audio)
+            return FakeResult(success=True, audios=[{"path": str(out_wav)}])
+
+        out_audio = _invoke_acestep_real_sync(
+            {
+                "version": "1.5",
+                "dit_handler": object(),
+                "llm_handler": object(),
+                "generate_music": fake_auto_gen,
+                "GenerationParams": FakeAutoParams,
+                "GenerationConfig": FakeAutoConfig,
+            },
+            task_type="text2music",
+            prompt=_build_acestep_prompt(["synthwave"], None, None),
+            lyrics="[Verse 1]\nNeon highway",
+            bpm=None,
+            musical_key=None,
+            duration_sec=None,
+            seed=None,
+            inference_steps=8,
+            guidance_scale=1.0,
+            target_sr=sr,
+            total_samples=None,
+            shift=3.0,
+        )
+        self.assertIsNone(captured["bpm"])
+        self.assertEqual(captured["keyscale"], "")
+        self.assertEqual(captured["duration"], -1.0)
+        self.assertIs(captured["thinking"], True)
+        self.assertIs(captured["llm_present"], True)
+        self.assertIs(captured["use_random_seed"], True)
+        self.assertIsNone(captured["seeds"])
+        self.assertEqual(out_audio.shape, (natural_samples, 2))
+
+        # Verify max_duration_sec safety cap when total_samples=None
+        with tempfile.TemporaryDirectory() as tmpd:
+            long_wav = Path(tmpd) / "long.wav"
+            long_buf = np.zeros((sr, 2), dtype=np.float32)
+            wavfile.write(str(long_wav), sr, long_buf)
+            capped = _read_and_fit_stereo(long_wav, sr, total_samples=None, max_duration_sec=0.2)
+            self.assertEqual(capped.shape, (int(round(0.2 * sr)), 2))
+
+        # 4. MOCK_GPU fallback defaults for Auto mode (28s, 116 BPM, A minor, 421337)
+        mbpm, mkey, mdur, mseed = resolve_mock_generation_params(
+            bpm=None, musical_key=None, duration_sec=None, seed=None
+        )
+        self.assertEqual(mbpm, 116.0)
+        self.assertEqual(mkey, "A minor")
+        self.assertEqual(mdur, 28.0)
+        self.assertEqual(mseed, 421337)
+
+        # 5. Beat grid handles target_bpm=None without octave doubling, vs target_bpm=120.0 doubling 59.4 -> 118.8
+        orig_mock_flag = beat_service.settings.mock_gpu
+        orig_librosa = beat_service.librosa
+        try:
+            object.__setattr__(beat_service.settings, "mock_gpu", False)
+            fake_librosa = types.SimpleNamespace(
+                beat=types.SimpleNamespace(beat_track=lambda y, sr, start_bpm, units: (59.4, np.array([0, 44, 88]))),
+                frames_to_time=lambda frames, sr: np.array([0.0, 1.01, 2.02]),
+            )
+            beat_service.librosa = fake_librosa
+            probe_audio = np.zeros((sr * 3, 2), dtype=np.float32)
+
+            grid_auto = analyze_beat_grid(probe_audio, sr, target_bpm=None, musical_key=None)
+            self.assertAlmostEqual(grid_auto.bpm, 59.4, places=2)
+            self.assertEqual(grid_auto.musical_key, "Auto")
+
+            grid_target = analyze_beat_grid(probe_audio, sr, target_bpm=120.0, musical_key="")
+            self.assertAlmostEqual(grid_target.bpm, 118.8, places=2)
+            self.assertEqual(grid_target.musical_key, "Auto")
+        finally:
+            object.__setattr__(beat_service.settings, "mock_gpu", orig_mock_flag)
+            beat_service.librosa = orig_librosa
+
+        # 6. Split Enhance modes ("tags", "lyrics", "all")
+        req_tags = ProducerEnhanceRequest(raw_prompt="dark synthwave", mode="tags", existing_lyrics="[Verse 1]\nKeep me")
+        self.assertEqual(req_tags.mode, "tags")
+
+        res_tags = _deterministic_fallback(
+            "dark synthwave drive",
+            preferred_duration=None,
+            mode="tags",
+            existing_lyrics="[Verse 1]\nUser custom line",
+        )
+        self.assertEqual(res_tags.mode, "tags")
+        self.assertGreaterEqual(len(res_tags.style_tags), 3)
+        self.assertEqual(res_tags.structured_lyrics, "[Verse 1]\nUser custom line")
+
+        res_lyrics = _deterministic_fallback(
+            "melancholic night walk",
+            preferred_duration=None,
+            mode="lyrics",
+            existing_style_tags=["ambient", "warm tape"],
+        )
+        self.assertEqual(res_lyrics.mode, "lyrics")
+        self.assertEqual(res_lyrics.style_tags, ["ambient", "warm tape"])
+        self.assertIn("[Verse 1]", res_lyrics.structured_lyrics)
+        self.assertIn("[Chorus]", res_lyrics.structured_lyrics)
+
+        norm_tags = _normalize_response(
+            {"style_tags": ["cyberpunk", "heavy bass"]},
+            provider="test-llm",
+            preferred_duration=None,
+            mode="tags",
+            existing_lyrics="[Chorus]\nFixed chorus",
+        )
+        self.assertEqual(norm_tags.style_tags, ["cyberpunk", "heavy bass"])
+        self.assertEqual(norm_tags.structured_lyrics, "[Chorus]\nFixed chorus")
+
+        # 7. Default 5Hz LM is acestep-5Hz-lm-1.7B in both _load_acestep_model and Lyrion_Colab_L4.ipynb
+        captured_lm_init: dict[str, object] = {}
+
+        class FakeDitHandler:
+            def initialize_service(self, project_root, config_path, device):
+                return ("Ready", True)
+
+        class FakeLlmHandler:
+            def initialize(self, checkpoint_dir, lm_model_path, backend, device, offload_to_cpu=False):
+                captured_lm_init["lm_model_path"] = lm_model_path
+                captured_lm_init["backend"] = backend
+                return ("LM Ready", True)
+
+        fake_torch_mod = types.ModuleType("torch")
+        fake_torch_mod.cuda = types.SimpleNamespace(is_available=lambda: False)
+        fake_acestep_pkg = types.ModuleType("acestep")
+        fake_handler_mod = types.ModuleType("acestep.handler")
+        fake_handler_mod.AceStepHandler = FakeDitHandler
+        fake_inf_mod = types.ModuleType("acestep.inference")
+        fake_inf_mod.GenerationConfig = FakeAutoConfig
+        fake_inf_mod.GenerationParams = FakeAutoParams
+        fake_inf_mod.generate_music = fake_auto_gen
+        fake_llm_mod = types.ModuleType("acestep.llm_inference")
+        fake_llm_mod.LLMHandler = FakeLlmHandler
+
+        prev_lm_env = os.environ.pop("ACESTEP_LM_MODEL_PATH", None)
+        orig_ace_mock = acestep_service.settings.mock_gpu
+        saved_mods = {
+            k: sys.modules.get(k)
+            for k in ("torch", "acestep", "acestep.handler", "acestep.inference", "acestep.llm_inference")
+        }
+        try:
+            object.__setattr__(acestep_service.settings, "mock_gpu", False)
+            sys.modules["torch"] = fake_torch_mod
+            sys.modules["acestep"] = fake_acestep_pkg
+            sys.modules["acestep.handler"] = fake_handler_mod
+            sys.modules["acestep.inference"] = fake_inf_mod
+            sys.modules["acestep.llm_inference"] = fake_llm_mod
+            bundle = _load_acestep_model()
+            self.assertEqual(bundle["version"], "1.5")
+            self.assertEqual(captured_lm_init.get("lm_model_path"), "acestep-5Hz-lm-1.7B")
+            self.assertEqual(captured_lm_init.get("backend"), "pt")
+        finally:
+            object.__setattr__(acestep_service.settings, "mock_gpu", orig_ace_mock)
+            if prev_lm_env is not None:
+                os.environ["ACESTEP_LM_MODEL_PATH"] = prev_lm_env
+            for k, v in saved_mods.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+        nb_path = Path(__file__).resolve().parents[2] / "Lyrion_Colab_L4.ipynb"
+        nb_text = json.dumps(json.loads(nb_path.read_text(encoding="utf-8")))
+        self.assertIn("acestep-5Hz-lm-1.7B", nb_text)
 
 
 if __name__ == "__main__":

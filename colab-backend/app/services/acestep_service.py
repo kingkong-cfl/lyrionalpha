@@ -261,8 +261,13 @@ def _filter_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in params}
 
 
-def _read_and_fit_stereo(audio_path: Path, target_sr: int, total_samples: int) -> np.ndarray:
-    """Read an audio file as float32 (total_samples, 2) at `target_sr`."""
+def _read_and_fit_stereo(
+    audio_path: Path,
+    target_sr: int,
+    total_samples: int | None,
+    max_duration_sec: float = 180.0,
+) -> np.ndarray:
+    """Read an audio file as float32 stereo at `target_sr`, fitting or preserving natural length."""
     try:
         import soundfile as sf  # type: ignore
 
@@ -274,12 +279,35 @@ def _read_and_fit_stereo(audio_path: Path, target_sr: int, total_samples: int) -
     stereo = StorageManager.ensure_stereo_float32(data)
     if sr != target_sr:
         stereo = StorageManager.resample_audio(stereo, sr, target_sr)
-    if stereo.shape[0] > total_samples:
+    if total_samples is None:
+        max_samples = max(1, int(round(max_duration_sec * target_sr)))
+        if stereo.shape[0] > max_samples:
+            stereo = stereo[:max_samples]
+    elif stereo.shape[0] > total_samples:
         stereo = stereo[:total_samples]
     elif stereo.shape[0] < total_samples:
         pad = np.zeros((total_samples - stereo.shape[0], 2), dtype=np.float32)
         stereo = np.concatenate([stereo, pad], axis=0)
     return np.ascontiguousarray(stereo, dtype=np.float32)
+
+
+def _build_acestep_prompt(
+    style_tags: list[str],
+    bpm: float | None,
+    musical_key: str | None,
+    extra_prefix: list[str] | None = None,
+) -> str:
+    """Build caption string omitting optional BPM/Key tokens when left in Auto mode."""
+    parts: list[str] = []
+    if extra_prefix:
+        parts.extend(p.strip() for p in extra_prefix if p and p.strip())
+    parts.extend(t.strip() for t in style_tags if t and t.strip())
+    if bpm is not None:
+        parts.append(f"{bpm:g} bpm")
+    clean_key = (musical_key or "").strip()
+    if clean_key:
+        parts.append(clean_key)
+    return ", ".join(parts)
 
 
 def _resolve_acestep_project_root() -> str:
@@ -329,7 +357,7 @@ def _load_acestep_model() -> Any:
         try:
             from acestep.llm_inference import LLMHandler  # type: ignore
 
-            lm_model_path = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
+            lm_model_path = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-1.7B").strip()
             lm_backend = os.environ.get("ACESTEP_LM_BACKEND", "pt").strip() or "pt"
             checkpoint_dir = str(Path(project_root) / "checkpoints")
             candidate_llm = LLMHandler()
@@ -377,14 +405,14 @@ def _invoke_acestep_real_sync(
     task_type: str,
     prompt: str,
     lyrics: str,
-    bpm: float,
-    musical_key: str,
-    duration_sec: float,
-    seed: int,
+    bpm: float | None,
+    musical_key: str | None,
+    duration_sec: float | None,
+    seed: int | None,
     inference_steps: int,
     guidance_scale: float,
     target_sr: int,
-    total_samples: int,
+    total_samples: int | None,
     shift: float = 3.0,
     src_audio: np.ndarray | None = None,
     repaint_start_sec: float = 0.0,
@@ -411,20 +439,22 @@ def _invoke_acestep_real_sync(
             llm_handler = pipe_bundle.get("llm_handler")
             use_thinking = bool(llm_handler is not None and task_type == "text2music")
 
+            clean_key = (musical_key or "").strip()
             param_kwargs: dict[str, Any] = {
                 "task_type": task_type,
                 "caption": prompt,
                 "prompt": prompt,
                 "lyrics": lyrics,
-                "bpm": int(round(bpm)),
-                "keyscale": musical_key,
-                "duration": float(duration_sec),
-                "seed": int(seed),
+                "bpm": int(round(bpm)) if bpm is not None else None,
+                "keyscale": clean_key,
+                "duration": float(duration_sec) if duration_sec is not None else -1.0,
                 "inference_steps": int(inference_steps),
                 "guidance_scale": float(guidance_scale),
                 "shift": float(shift),
                 "thinking": use_thinking,
             }
+            if seed is not None:
+                param_kwargs["seed"] = int(seed)
             if src_path is not None:
                 param_kwargs["src_audio"] = str(src_path)
                 param_kwargs["repainting_start"] = float(repaint_start_sec)
@@ -437,8 +467,8 @@ def _invoke_acestep_real_sync(
                     {
                         "batch_size": 1,
                         "audio_format": "wav",
-                        "use_random_seed": False,
-                        "seeds": [int(seed)],
+                        "use_random_seed": seed is None,
+                        "seeds": [int(seed)] if seed is not None else None,
                     },
                 )
             )
@@ -483,14 +513,15 @@ def _invoke_acestep_real_sync(
         pipe = pipe_bundle["pipeline"] if isinstance(pipe_bundle, dict) and "pipeline" in pipe_bundle else pipe_bundle
         out_path = Path(tmpdir) / "out.wav"
         pipe_kwargs: dict[str, Any] = {
-            "audio_duration": float(duration_sec),
+            "audio_duration": float(duration_sec) if duration_sec is not None else 30.0,
             "prompt": prompt,
             "lyrics": lyrics,
             "infer_step": int(inference_steps),
             "guidance_scale": float(guidance_scale),
-            "manual_seeds": [int(seed)],
             "save_path": str(out_path),
         }
+        if seed is not None:
+            pipe_kwargs["manual_seeds"] = [int(seed)]
         if src_path is not None:
             pipe_kwargs["task"] = task_type
             pipe_kwargs["repaint_start"] = float(repaint_start_sec)
@@ -500,38 +531,60 @@ def _invoke_acestep_real_sync(
         return _read_and_fit_stereo(out_path, target_sr, total_samples)
 
 
+def resolve_mock_generation_params(
+    *,
+    bpm: float | None,
+    musical_key: str | None,
+    duration_sec: float | None,
+    seed: int | None,
+) -> tuple[float, str, float, int]:
+    """Resolve deterministic synthetic defaults when MOCK_GPU=true receives Auto (None) fields."""
+    resolved_bpm = float(bpm) if bpm is not None else 116.0
+    resolved_key = (musical_key or "").strip() or "A minor"
+    resolved_dur = float(duration_sec) if duration_sec is not None else 28.0
+    resolved_seed = int(seed) if seed is not None else 421337
+    return resolved_bpm, resolved_key, resolved_dur, resolved_seed
+
+
 async def generate_full_song(
     *,
-    bpm: float,
-    musical_key: str,
-    duration_sec: float,
+    bpm: float | None = None,
+    musical_key: str | None = None,
+    duration_sec: float | None = None,
     style_tags: list[str],
     structured_lyrics: str,
-    seed: int,
+    seed: int | None = None,
     guidance_scale: float = 1.0,
     inference_steps: int = 8,
     shift: float = 3.0,
 ) -> tuple[np.ndarray, int]:
     """Generate a full stereo mix at canonical 44,100 Hz using ACE-Step 1.5 in bfloat16."""
     target_sr = settings.sample_rate
-    total_samples = max(target_sr, int(round(duration_sec * target_sr)))
 
     async with model_manager.acquire(ModelType.ACE_STEP, _load_acestep_model) as pipe:
         if settings.mock_gpu:
             await asyncio.sleep(0.15)
+            mock_bpm, mock_key, mock_dur, mock_seed = resolve_mock_generation_params(
+                bpm=bpm,
+                musical_key=musical_key,
+                duration_sec=duration_sec,
+                seed=seed,
+            )
+            total_samples = max(target_sr, int(round(mock_dur * target_sr)))
             audio = await asyncio.to_thread(
                 _synthesize_musical_mix,
                 total_samples,
                 target_sr,
-                bpm,
-                musical_key,
-                seed,
+                mock_bpm,
+                mock_key,
+                mock_seed,
                 style_tags,
                 "full",
             )
             return audio, target_sr
 
-        prompt = ", ".join(style_tags + [f"{bpm} bpm", musical_key])
+        prompt = _build_acestep_prompt(style_tags, bpm, musical_key)
+        total_samples = max(target_sr, int(round(duration_sec * target_sr))) if duration_sec is not None else None
         stereo = await asyncio.to_thread(
             _invoke_acestep_real_sync,
             pipe,
@@ -592,8 +645,12 @@ async def repaint_region(
             )
             return fresh[start_sample:end_sample]
 
-        prompt_parts = ([instrument_hint] if instrument_hint else []) + style_tags + [f"{bpm} bpm", musical_key]
-        prompt = ", ".join(p for p in prompt_parts if p)
+        prompt = _build_acestep_prompt(
+            style_tags,
+            bpm,
+            musical_key,
+            extra_prefix=[instrument_hint] if instrument_hint else None,
+        )
 
         stereo = await asyncio.to_thread(
             _invoke_acestep_real_sync,

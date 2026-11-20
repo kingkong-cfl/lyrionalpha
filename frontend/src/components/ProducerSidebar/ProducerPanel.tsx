@@ -1,32 +1,61 @@
 import React, { useEffect, useState } from "react";
-import { FolderPlus, Music2, Sparkles, Wand2 } from "lucide-react";
-import type { ProjectSchema } from "../../types/project";
+import { FileText, FolderPlus, Music2, Sparkles, Tags, Wand2 } from "lucide-react";
+import type { EnhanceMode, ProducerEnhanceResponse, ProjectSchema } from "../../types/project";
 
 interface ProducerPanelProps {
   projects: ProjectSchema[];
   activeProject: ProjectSchema | null;
   onSelectProject: (projectId: string) => void;
   onCreateProject: (name: string) => Promise<void>;
-  onEnhancePrompt: (rawPrompt: string, durationSec: number) => Promise<{
-    bpm: number;
-    musical_key: string;
-    duration_sec: number;
-    style_tags: string[];
-    structured_lyrics: string;
-    provider: string;
-  }>;
+  onEnhancePrompt: (
+    rawPrompt: string,
+    options?: {
+      preferredDurationSec?: number | null;
+      mode?: EnhanceMode;
+      existingStyleTags?: string[];
+      existingLyrics?: string;
+    }
+  ) => Promise<ProducerEnhanceResponse>;
   onGenerateSong: (params: {
     raw_prompt: string;
     style_tags: string[];
     structured_lyrics: string;
-    bpm: number;
-    musical_key: string;
-    duration_sec: number;
-    seed: number;
+    bpm: number | null;
+    musical_key: string | null;
+    duration_sec: number | null;
+    seed: number | null;
     separate_stems: boolean;
   }) => Promise<void>;
   busy: boolean;
   connected: boolean;
+}
+
+function sanitizeDecimalDraft(raw: string): string {
+  const cleaned = raw.replace(/[^\d.]/g, "");
+  const dotIdx = cleaned.indexOf(".");
+  const singleDot =
+    dotIdx === -1
+      ? cleaned
+      : cleaned.slice(0, dotIdx + 1) + cleaned.slice(dotIdx + 1).replace(/\./g, "");
+  return singleDot.replace(/^0+(?=\d)/, "");
+}
+
+function sanitizeIntegerDraft(raw: string): string {
+  return raw.replace(/\D/g, "").replace(/^0+(?=\d)/, "");
+}
+
+function parseOptionalNumber(
+  raw: string,
+  min: number,
+  max: number,
+  integer = false
+): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parsed = integer ? parseInt(trimmed, 10) : parseFloat(trimmed);
+  if (!Number.isFinite(parsed)) return null;
+  const clamped = Math.max(min, Math.min(max, parsed));
+  return integer ? Math.round(clamped) : Math.round(clamped * 10) / 10;
 }
 
 export const ProducerPanel: React.FC<ProducerPanelProps> = ({
@@ -49,20 +78,33 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
   const [structuredLyrics, setStructuredLyrics] = useState(
     "[Verse 1]\nStreetlights blur across the midnight glass\nCounting down the miles as shadows pass\n\n[Chorus]\nOut on the neon horizon we run\nChasing the pulse till the rising sun"
   );
-  const [bpm, setBpm] = useState(120);
-  const [musicalKey, setMusicalKey] = useState("A minor");
-  const [durationSec, setDurationSec] = useState(30);
-  const [seed, setSeed] = useState(421337);
+  const [bpmInput, setBpmInput] = useState("");
+  const [musicalKeyInput, setMusicalKeyInput] = useState("");
+  const [durationInput, setDurationInput] = useState("");
+  const [seedInput, setSeedInput] = useState("");
   const [separateStems, setSeparateStems] = useState(true);
   const [providerBadge, setProviderBadge] = useState<string | null>(null);
-  const [enhancing, setEnhancing] = useState(false);
+  const [enhancingMode, setEnhancingMode] = useState<EnhanceMode | null>(null);
 
   useEffect(() => {
     if (!activeProject) return;
-    setBpm(activeProject.grid.bpm || 120);
-    setMusicalKey(activeProject.grid.musical_key || "A minor");
-    if (activeProject.grid.duration_sec > 0) {
-      setDurationSec(Math.round(activeProject.grid.duration_sec));
+    if (activeProject.tracks.length > 0) {
+      setBpmInput(
+        activeProject.grid.bpm > 0 ? String(Math.round(activeProject.grid.bpm * 10) / 10) : ""
+      );
+      const rawKey = (activeProject.grid.musical_key || "").trim();
+      setMusicalKeyInput(
+        rawKey && rawKey.toLowerCase() !== "auto" && rawKey.toLowerCase() !== "unknown"
+          ? rawKey
+          : ""
+      );
+      setDurationInput(
+        activeProject.grid.duration_sec > 0 ? String(Math.round(activeProject.grid.duration_sec)) : ""
+      );
+    } else {
+      setBpmInput("");
+      setMusicalKeyInput("");
+      setDurationInput("");
     }
     if (activeProject.producer_spec.raw_prompt) {
       setRawPrompt(activeProject.producer_spec.raw_prompt);
@@ -73,45 +115,67 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
     if (activeProject.producer_spec.structured_lyrics) {
       setStructuredLyrics(activeProject.producer_spec.structured_lyrics);
     }
-    setSeed(activeProject.producer_spec.seed || 421337);
+    setSeedInput(
+      activeProject.producer_spec.seed !== null && activeProject.producer_spec.seed !== undefined
+        ? String(activeProject.producer_spec.seed)
+        : ""
+    );
   }, [
     activeProject?.project_id,
+    activeProject?.tracks.length,
     activeProject?.grid.bpm,
     activeProject?.grid.duration_sec,
     activeProject?.grid.musical_key,
     activeProject?.producer_spec.seed,
   ]);
 
-  const handleEnhance = async () => {
+  const currentTagsList = () =>
+    styleTagsText
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  const handleEnhance = async (mode: EnhanceMode) => {
     if (!rawPrompt.trim()) return;
-    setEnhancing(true);
+    setEnhancingMode(mode);
     try {
-      const res = await onEnhancePrompt(rawPrompt, durationSec);
-      setBpm(res.bpm);
-      setMusicalKey(res.musical_key);
-      setDurationSec(Math.round(res.duration_sec));
-      setStyleTagsText(res.style_tags.join(", "));
-      setStructuredLyrics(res.structured_lyrics);
+      const res = await onEnhancePrompt(rawPrompt, {
+        preferredDurationSec: parseOptionalNumber(durationInput, 8, 240),
+        mode,
+        existingStyleTags: currentTagsList(),
+        existingLyrics: structuredLyrics,
+      });
+      if (mode === "tags") {
+        setStyleTagsText(res.style_tags.join(", "));
+      } else if (mode === "lyrics") {
+        setStructuredLyrics(res.structured_lyrics);
+      } else {
+        setBpmInput(String(Math.round(res.bpm * 10) / 10));
+        setMusicalKeyInput(res.musical_key);
+        setDurationInput(String(Math.round(res.duration_sec)));
+        setStyleTagsText(res.style_tags.join(", "));
+        setStructuredLyrics(res.structured_lyrics);
+      }
       setProviderBadge(res.provider);
     } finally {
-      setEnhancing(false);
+      setEnhancingMode(null);
     }
   };
 
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
-    const tags = styleTagsText
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const bpmVal = parseOptionalNumber(bpmInput, 21, 300);
+    const durationVal = parseOptionalNumber(durationInput, 8, 240);
+    const seedVal = parseOptionalNumber(seedInput, 0, 2_147_483_647, true);
+    const cleanKey = musicalKeyInput.trim();
     await onGenerateSong({
       raw_prompt: rawPrompt,
-      style_tags: tags,
+      style_tags: currentTagsList(),
       structured_lyrics: structuredLyrics,
-      bpm,
-      musical_key: musicalKey,
-      duration_sec: durationSec,
-      seed,
+      bpm: bpmVal,
+      musical_key: cleanKey || null,
+      duration_sec: durationVal,
+      seed: seedVal,
       separate_stems: separateStems,
     });
   };
@@ -193,58 +257,95 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
             className="w-full rounded-md border border-studio-border bg-studio-bg p-2 text-xs text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
             placeholder="Describe genre, mood, instruments, vocal style..."
           />
-          <button
-            type="button"
-            disabled={!connected || enhancing || !rawPrompt.trim()}
-            onClick={handleEnhance}
-            className="mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-md border border-cyan-500/40 bg-cyan-500/10 py-1.5 text-xs font-medium text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40 transition"
-          >
-            <Wand2 className={`h-3.5 w-3.5 ${enhancing ? "animate-spin" : ""}`} />
-            <span>{enhancing ? "Structuring via LLM..." : "Enhance Lyrics & Tags (Zero-VRAM)"}</span>
-          </button>
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <button
+              type="button"
+              disabled={!connected || enhancingMode !== null || !rawPrompt.trim()}
+              onClick={() => handleEnhance("tags")}
+              title="Generate or refine only Style Tags (keeps Lyrics, BPM, Key & Duration untouched)"
+              className="flex flex-1 items-center justify-center gap-1 rounded-md border border-cyan-500/40 bg-cyan-500/10 py-1.5 text-[11px] font-medium text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-40 transition"
+            >
+              <Tags className={`h-3 w-3 ${enhancingMode === "tags" ? "animate-spin" : ""}`} />
+              <span>{enhancingMode === "tags" ? "Tags..." : "Enhance Tags"}</span>
+            </button>
+            <button
+              type="button"
+              disabled={!connected || enhancingMode !== null || !rawPrompt.trim()}
+              onClick={() => handleEnhance("lyrics")}
+              title="Write or structure only Lyrics (keeps Style Tags, BPM, Key & Duration untouched)"
+              className="flex flex-1 items-center justify-center gap-1 rounded-md border border-indigo-500/40 bg-indigo-500/10 py-1.5 text-[11px] font-medium text-indigo-300 hover:bg-indigo-500/20 disabled:opacity-40 transition"
+            >
+              <FileText className={`h-3 w-3 ${enhancingMode === "lyrics" ? "animate-spin" : ""}`} />
+              <span>{enhancingMode === "lyrics" ? "Lyrics..." : "Enhance Lyrics"}</span>
+            </button>
+            <button
+              type="button"
+              disabled={!connected || enhancingMode !== null || !rawPrompt.trim()}
+              onClick={() => handleEnhance("all")}
+              title="Auto-fill Tags, Lyrics, BPM, Key & Duration together"
+              className="flex items-center justify-center gap-1 rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 text-[11px] font-medium text-slate-300 hover:border-cyan-500/40 hover:text-cyan-200 disabled:opacity-40 transition"
+            >
+              <Wand2 className={`h-3 w-3 ${enhancingMode === "all" ? "animate-spin" : ""}`} />
+              <span>All</span>
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2.5">
           <div>
-            <label className="mb-1 block text-[11px] text-slate-400">BPM</label>
+            <label className="mb-1 block text-[11px] text-slate-400">BPM (Optional)</label>
             <input
-              type="number"
-              min={50}
-              max={220}
-              step={1}
-              value={bpm}
-              onChange={(e) => setBpm(Number(e.target.value))}
-              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+              type="text"
+              inputMode="decimal"
+              value={bpmInput}
+              placeholder="Auto"
+              onChange={(e) => setBpmInput(sanitizeDecimalDraft(e.target.value))}
+              onBlur={() => {
+                const parsed = parseOptionalNumber(bpmInput, 21, 300);
+                setBpmInput(parsed !== null ? String(parsed) : "");
+              }}
+              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
             />
           </div>
           <div>
-            <label className="mb-1 block text-[11px] text-slate-400">Musical Key</label>
+            <label className="mb-1 block text-[11px] text-slate-400">Musical Key (Optional)</label>
             <input
               type="text"
-              value={musicalKey}
-              onChange={(e) => setMusicalKey(e.target.value)}
-              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+              value={musicalKeyInput}
+              placeholder="Auto"
+              onChange={(e) => setMusicalKeyInput(e.target.value)}
+              onBlur={() => setMusicalKeyInput((v) => v.trim())}
+              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
             />
           </div>
           <div>
             <label className="mb-1 block text-[11px] text-slate-400">Duration (sec)</label>
             <input
-              type="number"
-              min={8}
-              max={180}
-              step={2}
-              value={durationSec}
-              onChange={(e) => setDurationSec(Number(e.target.value))}
-              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+              type="text"
+              inputMode="decimal"
+              value={durationInput}
+              placeholder="Auto"
+              onChange={(e) => setDurationInput(sanitizeDecimalDraft(e.target.value))}
+              onBlur={() => {
+                const parsed = parseOptionalNumber(durationInput, 8, 240);
+                setDurationInput(parsed !== null ? String(parsed) : "");
+              }}
+              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
             />
           </div>
           <div>
-            <label className="mb-1 block text-[11px] text-slate-400">Seed</label>
+            <label className="mb-1 block text-[11px] text-slate-400">Seed (Optional)</label>
             <input
-              type="number"
-              value={seed}
-              onChange={(e) => setSeed(Number(e.target.value))}
-              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+              type="text"
+              inputMode="numeric"
+              value={seedInput}
+              placeholder="Auto"
+              onChange={(e) => setSeedInput(sanitizeIntegerDraft(e.target.value))}
+              onBlur={() => {
+                const parsed = parseOptionalNumber(seedInput, 0, 2_147_483_647, true);
+                setSeedInput(parsed !== null ? String(parsed) : "");
+              }}
+              className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 font-mono text-xs text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
             />
           </div>
         </div>

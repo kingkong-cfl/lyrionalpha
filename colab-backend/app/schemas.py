@@ -11,6 +11,7 @@ TrackType = Literal["audio", "stem", "midi", "mic_recording"]
 StemRole = Literal["full_mix", "vocals", "drums", "bass", "other", "custom"]
 RepaintMode = Literal["repaint_and_restem", "single_track_repaint", "add_instrument_layer", "lego_layer"]
 JobStatusType = Literal["queued", "running", "completed", "failed"]
+EnhanceMode = Literal["all", "tags", "lyrics"]
 
 
 def utc_now_iso() -> str:
@@ -81,7 +82,7 @@ class ProducerSpecSchema(BaseModel):
     raw_prompt: str = ""
     style_tags: list[str] = Field(default_factory=list)
     structured_lyrics: str = ""
-    seed: int = 421337
+    seed: Optional[int] = None
     guidance_scale: float = 1.0
     inference_steps: int = 8
     shift: float = 3.0
@@ -135,10 +136,14 @@ class HealthResponse(BaseModel):
 class ProducerEnhanceRequest(BaseModel):
     raw_prompt: str = Field(..., min_length=1)
     preferred_duration_sec: Optional[float] = Field(default=None, ge=8.0, le=240.0)
+    mode: EnhanceMode = "all"
+    existing_style_tags: Optional[list[str]] = None
+    existing_lyrics: Optional[str] = None
 
 
 class ProducerEnhanceResponse(BaseModel):
     provider: str
+    mode: EnhanceMode = "all"
     bpm: float
     musical_key: str
     time_signature: str = "4/4"
@@ -164,10 +169,10 @@ class GenerateSongRequest(BaseModel):
     raw_prompt: str = ""
     style_tags: list[str] = Field(default_factory=list)
     structured_lyrics: str = ""
-    bpm: float = Field(default=120.0, gt=20.0, le=300.0)
-    musical_key: str = "A minor"
-    duration_sec: float = Field(default=30.0, ge=8.0, le=240.0)
-    seed: int = 421337
+    bpm: Optional[float] = Field(default=None, gt=20.0, le=300.0)
+    musical_key: Optional[str] = None
+    duration_sec: Optional[float] = Field(default=None, ge=8.0, le=240.0)
+    seed: Optional[int] = None
     guidance_scale: float = 1.0
     inference_steps: int = 8
     shift: float = 3.0

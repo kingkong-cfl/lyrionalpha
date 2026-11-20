@@ -82,7 +82,7 @@
         "raw_prompt": { "type": "string" },
         "style_tags": { "type": "array", "items": { "type": "string" } },
         "structured_lyrics": { "type": "string" },
-        "seed": { "type": "integer" },
+        "seed": { "type": ["integer", "null"] },
         "guidance_scale": { "type": "number" },
         "inference_steps": { "type": "integer" },
         "shift": { "type": "number", "default": 3.0 }

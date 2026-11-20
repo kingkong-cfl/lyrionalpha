@@ -379,10 +379,10 @@ export function App() {
     raw_prompt: string;
     style_tags: string[];
     structured_lyrics: string;
-    bpm: number;
-    musical_key: string;
-    duration_sec: number;
-    seed: number;
+    bpm: number | null;
+    musical_key: string | null;
+    duration_sec: number | null;
+    seed: number | null;
     separate_stems: boolean;
   }) => {
     try {
@@ -722,7 +722,7 @@ export function App() {
           activeProject={activeProject}
           onSelectProject={handleSelectProject}
           onCreateProject={handleCreateProject}
-          onEnhancePrompt={(prompt, dur) => enhanceWithProducer(serverUrl, prompt, dur)}
+          onEnhancePrompt={(prompt, options) => enhanceWithProducer(serverUrl, prompt, options)}
           onGenerateSong={handleGenerateSong}
           busy={busy}
           connected={Boolean(health)}

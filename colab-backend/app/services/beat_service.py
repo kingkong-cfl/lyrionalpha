@@ -58,8 +58,8 @@ def _correct_octave_tempo(
 def analyze_beat_grid(
     audio: np.ndarray,
     sample_rate: int = settings.sample_rate,
-    target_bpm: float = 120.0,
-    musical_key: str = "A minor",
+    target_bpm: float | None = 120.0,
+    musical_key: str | None = "A minor",
     time_signature: str = "4/4",
 ) -> BeatGridSchema:
     """
@@ -71,7 +71,8 @@ def analyze_beat_grid(
     duration_sec = round(total_samples / float(sample_rate), 6) if sample_rate > 0 else 0.0
     beats_per_bar = int(time_signature.split("/")[0]) if "/" in time_signature else 4
 
-    detected_bpm = float(target_bpm)
+    clean_key = (musical_key or "").strip() or "Auto"
+    detected_bpm = float(target_bpm) if target_bpm is not None else 120.0
     beat_times: list[float] = []
 
     if not settings.mock_gpu and librosa is not None and total_samples > sample_rate:
@@ -80,18 +81,24 @@ def analyze_beat_grid(
             tempo, beat_frames = librosa.beat.beat_track(
                 y=mono.astype(np.float32),
                 sr=sample_rate,
-                start_bpm=float(target_bpm),
+                start_bpm=float(target_bpm) if target_bpm is not None else 120.0,
                 units="frames",
             )
             tempo_val = float(np.atleast_1d(tempo)[0])
             raw_times = librosa.frames_to_time(beat_frames, sr=sample_rate).tolist()
-            corrected_bpm, corrected_times = _correct_octave_tempo(
-                tempo_val, raw_times, float(target_bpm), duration_sec
-            )
-            if 45.0 <= corrected_bpm <= 220.0:
-                detected_bpm = corrected_bpm
-            if len(corrected_times) >= 2:
-                beat_times = corrected_times
+            if target_bpm is not None:
+                corrected_bpm, corrected_times = _correct_octave_tempo(
+                    tempo_val, raw_times, float(target_bpm), duration_sec
+                )
+                if 45.0 <= corrected_bpm <= 220.0:
+                    detected_bpm = corrected_bpm
+                if len(corrected_times) >= 2:
+                    beat_times = corrected_times
+            else:
+                if 45.0 <= tempo_val <= 220.0:
+                    detected_bpm = round(tempo_val, 2)
+                if len(raw_times) >= 2:
+                    beat_times = [round(float(t), 6) for t in raw_times if 0.0 <= t < duration_sec]
         except Exception as exc:
             logger.warning("librosa beat_track fallback triggered: %s", exc)
 
@@ -123,7 +130,7 @@ def analyze_beat_grid(
         duration_sec=duration_sec,
         bpm=round(detected_bpm, 2),
         time_signature=time_signature,
-        musical_key=musical_key,
+        musical_key=clean_key,
         beat_timestamps=dedup_times,
         beat_samples=dedup_samples,
         downbeat_beat_indices=downbeat_indices,

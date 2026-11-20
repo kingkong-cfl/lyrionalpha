@@ -1,4 +1,5 @@
 import type {
+  EnhanceMode,
   HealthResponse,
   JobCreatedResponse,
   JobStatusResponse,
@@ -94,13 +95,21 @@ export async function fetchHealth(baseUrl: string): Promise<{ health: HealthResp
 export async function enhanceWithProducer(
   baseUrl: string,
   rawPrompt: string,
-  preferredDurationSec?: number
+  options?: {
+    preferredDurationSec?: number | null;
+    mode?: EnhanceMode;
+    existingStyleTags?: string[];
+    existingLyrics?: string;
+  }
 ): Promise<ProducerEnhanceResponse> {
   return apiFetch<ProducerEnhanceResponse>(baseUrl, "/api/v1/producer/enhance", {
     method: "POST",
     body: JSON.stringify({
       raw_prompt: rawPrompt,
-      preferred_duration_sec: preferredDurationSec ?? null,
+      preferred_duration_sec: options?.preferredDurationSec ?? null,
+      mode: options?.mode ?? "all",
+      existing_style_tags: options?.existingStyleTags ?? null,
+      existing_lyrics: options?.existingLyrics ?? null,
     }),
   });
 }
@@ -149,10 +158,10 @@ export async function triggerGenerateSong(
     raw_prompt: string;
     style_tags: string[];
     structured_lyrics: string;
-    bpm: number;
-    musical_key: string;
-    duration_sec: number;
-    seed: number;
+    bpm: number | null;
+    musical_key: string | null;
+    duration_sec: number | null;
+    seed: number | null;
     separate_stems: boolean;
   }
 ): Promise<JobCreatedResponse> {

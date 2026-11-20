@@ -15,4 +15,7 @@ async def enhance_producer_spec(req: ProducerEnhanceRequest) -> ProducerEnhanceR
     return await enhance_prompt(
         raw_prompt=req.raw_prompt,
         preferred_duration_sec=req.preferred_duration_sec,
+        mode=req.mode,
+        existing_style_tags=req.existing_style_tags,
+        existing_lyrics=req.existing_lyrics,
     )

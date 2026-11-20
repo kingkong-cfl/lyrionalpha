@@ -6,6 +6,7 @@ export type RepaintMode =
   | "add_instrument_layer"
   | "lego_layer";
 export type JobStatusType = "queued" | "running" | "completed" | "failed";
+export type EnhanceMode = "all" | "tags" | "lyrics";
 
 export interface EqSettings {
   low_shelf_db: number;
@@ -71,7 +72,7 @@ export interface ProducerSpecSchema {
   raw_prompt: string;
   style_tags: string[];
   structured_lyrics: string;
-  seed: number;
+  seed: number | null;
   guidance_scale: number;
   inference_steps: number;
   shift?: number;
@@ -121,6 +122,7 @@ export interface HealthResponse {
 
 export interface ProducerEnhanceResponse {
   provider: string;
+  mode?: EnhanceMode;
   bpm: number;
   musical_key: string;
   time_signature: string;
