@@ -191,6 +191,9 @@ class StorageManager:
             return preview_path, media_type
 
         stereo, sr = self.read_wav(project_id, rel_path, target_sr=settings.sample_rate)
+        peak = float(np.max(np.abs(stereo))) if stereo.size else 0.0
+        if peak > 0.99:
+            stereo = stereo * (0.99 / peak)
         clipped = np.clip(stereo, -1.0, 1.0).astype(np.float32, copy=False)
         tmp_path = preview_path.with_name(f"{preview_path.name}.{uuid.uuid4().hex[:6]}.tmp")
         try:

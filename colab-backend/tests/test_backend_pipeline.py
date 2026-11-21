@@ -1411,6 +1411,273 @@ class BackendPipelineTest(unittest.TestCase):
         nb_text = json.dumps(json.loads(nb_path.read_text(encoding="utf-8")))
         self.assertIn("acestep-5Hz-lm-1.7B", nb_text)
 
+    def test_10_quality_turkish_cot_profiles_ab_and_gemini(self):
+        import inspect
+        import json
+        import sys
+        import types
+        from dataclasses import dataclass
+
+        import numpy as np
+        from scipy.io import wavfile
+
+        from app.routers.generation import resolve_effective_style_tags
+        from app.services import acestep_service, llm_producer
+        from app.services.acestep_service import (
+            _load_acestep_model,
+            _read_and_fit_stereo,
+            resolve_model_inference_profile,
+            resolve_vocal_language,
+        )
+
+        # 1. resolve_vocal_language auto-detection (Turkish diacritics, ASCII Turkish words, English, explicit)
+        self.assertEqual(resolve_vocal_language(None, "[Verse 1]\nYağmur yağıyor şehirde gece"), ("tr", False))
+        self.assertEqual(resolve_vocal_language("auto", "[Verse 1]\nBu gece kalp ve zaman susar"), ("tr", False))
+        self.assertEqual(resolve_vocal_language(None, "[Verse 1]\nMidnight lights fade into the horizon"), ("unknown", True))
+        self.assertEqual(resolve_vocal_language("en", "[Verse 1]\nTürkçe kelime olsa bile"), ("en", False))
+        self.assertEqual(resolve_vocal_language("instrumental", ""), ("unknown", False))
+
+        # 2. _invoke_acestep_real_sync passes vocal_language & CoT params on text2music, False on repaint
+        sr = 44100
+        n = sr // 4
+        t = np.linspace(0.0, 0.25, n, endpoint=False, dtype=np.float32)
+        orig = np.zeros((n, 2), dtype=np.float32)
+        cot_calls: list[dict[str, object]] = []
+
+        @dataclass
+        class FakeCotParams:
+            task_type: str
+            caption: str
+            lyrics: str
+            bpm: int | None = None
+            keyscale: str = ""
+            duration: float = -1.0
+            vocal_language: str = "unknown"
+            inference_steps: int = 8
+            guidance_scale: float = 1.0
+            shift: float = 3.0
+            thinking: bool = False
+            use_cot_metas: bool = False
+            use_cot_caption: bool = False
+            use_cot_language: bool = False
+            use_constrained_decoding: bool = False
+            lm_cfg_scale: float = 2.0
+            src_audio: str | None = None
+            repainting_start: float = 0.0
+            repainting_end: float = 0.0
+
+        @dataclass
+        class FakeCotConfig:
+            batch_size: int = 1
+            audio_format: str = "wav"
+            use_random_seed: bool = False
+            seeds: list[int] | None = None
+
+        @dataclass
+        class FakeCotResult:
+            success: bool
+            audios: list[dict[str, str]]
+
+        def fake_cot_generate(dit_handler, llm_handler, params, config, save_dir):
+            cot_calls.append(
+                {
+                    "task_type": params.task_type,
+                    "vocal_language": params.vocal_language,
+                    "use_cot_metas": params.use_cot_metas,
+                    "use_cot_caption": params.use_cot_caption,
+                    "use_cot_language": params.use_cot_language,
+                    "use_constrained_decoding": params.use_constrained_decoding,
+                    "lm_cfg_scale": params.lm_cfg_scale,
+                    "steps": params.inference_steps,
+                    "guidance": params.guidance_scale,
+                }
+            )
+            out_wav = Path(save_dir) / f"cot_{params.task_type}.wav"
+            audio = np.stack([0.2 * np.sin(2 * np.pi * 220 * t), 0.2 * np.sin(2 * np.pi * 220 * t)], axis=1).astype(
+                np.float32
+            )
+            wavfile.write(str(out_wav), sr, audio)
+            return FakeCotResult(success=True, audios=[{"path": str(out_wav)}])
+
+        cot_bundle = {
+            "version": "1.5",
+            "config_path": "acestep-v15-xl-turbo",
+            "display_name": "acestep-v15-xl-turbo + lm-4B",
+            "dit_handler": object(),
+            "llm_handler": object(),
+            "generate_music": fake_cot_generate,
+            "GenerationParams": FakeCotParams,
+            "GenerationConfig": FakeCotConfig,
+        }
+        _invoke_acestep_real_sync(
+            cot_bundle,
+            task_type="text2music",
+            prompt="indie rock",
+            lyrics="[Verse 1]\nKaranlık sokaklar ve yağmur",
+            bpm=None,
+            musical_key=None,
+            duration_sec=None,
+            seed=None,
+            inference_steps=8,
+            guidance_scale=1.0,
+            target_sr=sr,
+            total_samples=n,
+            shift=3.0,
+            vocal_language=None,
+        )
+        _invoke_acestep_real_sync(
+            cot_bundle,
+            task_type="repaint",
+            prompt="indie rock",
+            lyrics="[Chorus]\nRun away",
+            bpm=120.0,
+            musical_key="A minor",
+            duration_sec=0.25,
+            seed=55,
+            inference_steps=8,
+            guidance_scale=1.0,
+            target_sr=sr,
+            total_samples=n,
+            shift=3.0,
+            vocal_language=None,
+            src_audio=orig,
+            repaint_start_sec=0.05,
+            repaint_end_sec=0.20,
+        )
+        self.assertEqual(cot_calls[0]["vocal_language"], "tr")
+        self.assertIs(cot_calls[0]["use_cot_metas"], True)
+        self.assertIs(cot_calls[0]["use_cot_caption"], True)
+        self.assertIs(cot_calls[0]["use_cot_language"], False)
+        self.assertIs(cot_calls[0]["use_constrained_decoding"], True)
+        self.assertAlmostEqual(float(cot_calls[0]["lm_cfg_scale"]), 2.0, places=4)
+
+        self.assertIs(cot_calls[1]["use_cot_metas"], False)
+        self.assertIs(cot_calls[1]["use_cot_caption"], False)
+        self.assertIs(cot_calls[1]["use_cot_language"], False)
+        self.assertIs(cot_calls[1]["use_constrained_decoding"], False)
+
+        # 3. _read_and_fit_stereo max_duration_sec default is 240.0
+        sig_read = inspect.signature(_read_and_fit_stereo)
+        self.assertEqual(sig_read.parameters["max_duration_sec"].default, 240.0)
+
+        # 4. resolve_model_inference_profile upgrades sft/base turbo defaults -> (32, 7.0), preserves turbo & overrides
+        self.assertEqual(resolve_model_inference_profile("acestep-v15-xl-sft", 8, 1.0, 3.0), (32, 7.0, 3.0))
+        self.assertEqual(resolve_model_inference_profile("acestep-v15-xl-sft", 50, 6.5, 3.0), (50, 6.5, 3.0))
+        self.assertEqual(resolve_model_inference_profile("acestep-v15-xl-turbo", 8, 1.0, 3.0), (8, 1.0, 3.0))
+
+        # 5. _load_acestep_model forwards offload_to_cpu & exposes active_model in model_manager telemetry
+        init_capture: dict[str, object] = {}
+
+        class FakeDitOffload:
+            def initialize_service(self, project_root, config_path, device, offload_to_cpu=False):
+                init_capture["dit_cfg"] = config_path
+                init_capture["dit_offload"] = offload_to_cpu
+                return ("Ready", True)
+
+        class FakeLlmOffload:
+            def initialize(self, checkpoint_dir, lm_model_path, backend, device, offload_to_cpu=False):
+                init_capture["lm_path"] = lm_model_path
+                init_capture["lm_offload"] = offload_to_cpu
+                return ("LM Ready", True)
+
+        class FakeLlmFail:
+            def initialize(self, checkpoint_dir, lm_model_path, backend, device, offload_to_cpu=False):
+                raise RuntimeError("Out of disk")
+
+        fake_torch_mod = types.ModuleType("torch")
+        fake_torch_mod.cuda = types.SimpleNamespace(is_available=lambda: False)
+        fake_acestep_pkg = types.ModuleType("acestep")
+        fake_handler_mod = types.ModuleType("acestep.handler")
+        fake_handler_mod.AceStepHandler = FakeDitOffload
+        fake_inf_mod = types.ModuleType("acestep.inference")
+        fake_inf_mod.GenerationConfig = FakeCotConfig
+        fake_inf_mod.GenerationParams = FakeCotParams
+        fake_inf_mod.generate_music = fake_cot_generate
+        fake_llm_mod = types.ModuleType("acestep.llm_inference")
+        fake_llm_mod.LLMHandler = FakeLlmOffload
+
+        saved_env = {k: os.environ.get(k) for k in ("ACESTEP_CONFIG_PATH", "ACESTEP_LM_MODEL_PATH", "ACESTEP_OFFLOAD_TO_CPU")}
+        saved_mods = {
+            k: sys.modules.get(k)
+            for k in ("torch", "acestep", "acestep.handler", "acestep.inference", "acestep.llm_inference")
+        }
+        orig_ace_mock = acestep_service.settings.mock_gpu
+        try:
+            os.environ["ACESTEP_CONFIG_PATH"] = "acestep-v15-xl-turbo"
+            os.environ["ACESTEP_LM_MODEL_PATH"] = "acestep-5Hz-lm-4B"
+            os.environ["ACESTEP_OFFLOAD_TO_CPU"] = "true"
+            object.__setattr__(acestep_service.settings, "mock_gpu", False)
+            sys.modules["torch"] = fake_torch_mod
+            sys.modules["acestep"] = fake_acestep_pkg
+            sys.modules["acestep.handler"] = fake_handler_mod
+            sys.modules["acestep.inference"] = fake_inf_mod
+            sys.modules["acestep.llm_inference"] = fake_llm_mod
+
+            loaded_bundle = _load_acestep_model()
+            self.assertIs(init_capture["dit_offload"], True)
+            self.assertIs(init_capture["lm_offload"], True)
+            self.assertEqual(loaded_bundle["display_name"], "acestep-v15-xl-turbo + lm-4B")
+            model_manager._active_model = loaded_bundle
+            model_manager._active_type = ModelType.ACE_STEP
+            self.assertEqual(model_manager.get_telemetry().active_model, "acestep-v15-xl-turbo + lm-4B")
+
+            fake_llm_mod.LLMHandler = FakeLlmFail
+            fallback_bundle = _load_acestep_model()
+            self.assertEqual(fallback_bundle["display_name"], "acestep-v15-xl-turbo + lm=OFF")
+        finally:
+            model_manager._active_model = None
+            model_manager._active_type = ModelType.NONE
+            object.__setattr__(acestep_service.settings, "mock_gpu", orig_ace_mock)
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            for k, v in saved_mods.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+        # 6. resolve_effective_style_tags fallback
+        self.assertEqual(resolve_effective_style_tags([], "  dark Turkish rock  "), ["dark Turkish rock"])
+        self.assertEqual(resolve_effective_style_tags(["synthwave", " ", "retrowave"], "ignored"), ["synthwave", "retrowave"])
+        self.assertEqual(resolve_effective_style_tags([" "], "   "), [])
+
+        # 7. Preview soft-peak scaling preserves waveform shape when peak > 0.99
+        proj = storage.create_project("Peak Soft Clip Test", bpm=120.0, musical_key="A minor")
+        hot_t = np.linspace(0.0, 0.25, n, endpoint=False, dtype=np.float32)
+        hot_sine = np.stack(
+            [1.5 * np.sin(2.0 * np.pi * 220.0 * hot_t), 1.5 * np.sin(2.0 * np.pi * 220.0 * hot_t)],
+            axis=1,
+        ).astype(np.float32)
+        hot_rel = _unique_wav_rel("raw", "hot_mix", 1)
+        storage.write_wav(proj.project_id, hot_rel, hot_sine, sample_rate=sr)
+        prev_path, _ = storage.get_or_create_preview_audio(proj.project_id, hot_rel)
+        decoded_hot, _ = storage.read_wav(
+            proj.project_id,
+            prev_path.relative_to(storage.project_dir(proj.project_id)).as_posix(),
+            target_sr=sr,
+        )
+        # Soft-scaled sine matches hot_sine * (0.99 / 1.5) everywhere instead of flat clipping at 1.0
+        expected_hot = hot_sine * (0.99 / float(np.max(np.abs(hot_sine))))
+        self.assertLess(float(np.max(np.abs(decoded_hot - expected_hot))), 5e-4)
+
+        # 8. llm_producer 25s timeout & Turkish conversational + English tag prompts
+        sig_post = inspect.signature(llm_producer._http_post_json)
+        self.assertEqual(sig_post.parameters["timeout"].default, 25.0)
+        self.assertIn("English", llm_producer.SYSTEM_PROMPT_TAGS)
+        self.assertIn("Turkish", llm_producer.SYSTEM_PROMPT_LYRICS)
+        self.assertIn("English", llm_producer.SYSTEM_PROMPT)
+
+        # 9. Lyrion_Colab_L4.ipynb contains #@param dropdown & all 4 L4 profiles
+        nb_path = Path(__file__).resolve().parents[2] / "Lyrion_Colab_L4.ipynb"
+        nb_data = json.loads(nb_path.read_text(encoding="utf-8"))
+        cell2_src = "".join(nb_data["cells"][1]["source"])
+        self.assertIn("#@param", cell2_src)
+        for profile in ("fast_2b_1.7b", "balanced_2b_4b_lm", "xl_turbo_4b", "xl_sft_4b"):
+            self.assertIn(profile, cell2_src)
+
 
 if __name__ == "__main__":
     unittest.main()

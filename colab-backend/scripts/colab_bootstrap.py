@@ -51,9 +51,45 @@ def check_acestep_versions(transformers_v: str, diffusers_v: str, hf_v: str) -> 
     return (4, 51, 0) <= t_ver < (4, 58, 0) and d_ver >= (0, 35, 0) and (0, 34, 0) <= h_ver < (1, 0, 0)
 
 
+def stream_command(
+    cmd: str | list[str],
+    *,
+    check: bool = True,
+    shell: bool = False,
+    log_path: Path | None = None,
+) -> int:
+    """Run a subprocess with unbuffered merged stdout/stderr streamed line-by-line into IPython."""
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        shell=shell,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    log_fh = log_path.open("a", encoding="utf-8") if log_path is not None else None
+    try:
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                if log_fh is not None:
+                    log_fh.write(line)
+                    log_fh.flush()
+    finally:
+        if log_fh is not None:
+            log_fh.close()
+    ret = proc.wait()
+    if check and ret != 0:
+        raise subprocess.CalledProcessError(ret, cmd)
+    return ret
+
+
 def run(cmd: str, check: bool = True) -> None:
     print(f"[Bootstrap] $ {cmd}", flush=True)
-    subprocess.run(cmd, shell=True, check=check)
+    stream_command(cmd, check=check, shell=True)
 
 
 def mount_google_drive() -> Path:
@@ -254,7 +290,10 @@ def main() -> None:
     print("=" * 72 + "\n", flush=True)
 
     try:
-        subprocess.run(
+        log_file_path = Path("/tmp/lyrion_backend.log")
+        if log_file_path.exists():
+            log_file_path.unlink()
+        stream_command(
             [
                 sys.executable,
                 "-m",
@@ -264,8 +303,12 @@ def main() -> None:
                 "0.0.0.0",
                 "--port",
                 str(port),
+                "--log-level",
+                "info",
             ],
             check=True,
+            shell=False,
+            log_path=log_file_path,
         )
     finally:
         tunnel_proc.terminate()

@@ -20,6 +20,7 @@ interface ProducerPanelProps {
     raw_prompt: string;
     style_tags: string[];
     structured_lyrics: string;
+    vocal_language?: string | null;
     bpm: number | null;
     musical_key: string | null;
     duration_sec: number | null;
@@ -58,6 +59,12 @@ function parseOptionalNumber(
   return integer ? Math.round(clamped) : Math.round(clamped * 10) / 10;
 }
 
+function countLyricWords(lyrics: string): number {
+  const withoutTags = lyrics.replace(/\[[^\]]+\]/g, " ").trim();
+  if (!withoutTags) return 0;
+  return withoutTags.split(/\s+/).filter(Boolean).length;
+}
+
 export const ProducerPanel: React.FC<ProducerPanelProps> = ({
   projects,
   activeProject,
@@ -82,6 +89,7 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
   const [musicalKeyInput, setMusicalKeyInput] = useState("");
   const [durationInput, setDurationInput] = useState("");
   const [seedInput, setSeedInput] = useState("");
+  const [vocalLanguage, setVocalLanguage] = useState("");
   const [separateStems, setSeparateStems] = useState(true);
   const [providerBadge, setProviderBadge] = useState<string | null>(null);
   const [enhancingMode, setEnhancingMode] = useState<EnhanceMode | null>(null);
@@ -120,6 +128,7 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
         ? String(activeProject.producer_spec.seed)
         : ""
     );
+    setVocalLanguage(activeProject.producer_spec.vocal_language || "");
   }, [
     activeProject?.project_id,
     activeProject?.tracks.length,
@@ -127,6 +136,7 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
     activeProject?.grid.duration_sec,
     activeProject?.grid.musical_key,
     activeProject?.producer_spec.seed,
+    activeProject?.producer_spec.vocal_language,
   ]);
 
   const currentTagsList = () =>
@@ -172,6 +182,7 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
       raw_prompt: rawPrompt,
       style_tags: currentTagsList(),
       structured_lyrics: structuredLyrics,
+      vocal_language: vocalLanguage || null,
       bpm: bpmVal,
       musical_key: cleanKey || null,
       duration_sec: durationVal,
@@ -179,6 +190,8 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
       separate_stems: separateStems,
     });
   };
+
+  const lyricWordCount = countLyricWords(structuredLyrics);
 
   return (
     <aside className="flex h-full w-full lg:w-80 xl:w-96 shrink-0 flex-col border-r border-studio-border bg-studio-panel overflow-y-auto">
@@ -350,13 +363,28 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
           </div>
         </div>
 
+        <div className="flex items-center justify-between gap-2">
+          <label className="text-[11px] text-slate-400">Vocal Language</label>
+          <select
+            value={vocalLanguage}
+            onChange={(e) => setVocalLanguage(e.target.value)}
+            className="rounded-md border border-studio-border bg-studio-bg px-2.5 py-1 font-mono text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+          >
+            <option value="">Auto (TR algıla)</option>
+            <option value="tr">Turkish (tr)</option>
+            <option value="en">English (en)</option>
+            <option value="instrumental">Instrumental / Other</option>
+          </select>
+        </div>
+
         <div>
           <label className="mb-1 block text-[11px] text-slate-400">Style Tags</label>
           <input
             type="text"
             value={styleTagsText}
             onChange={(e) => setStyleTagsText(e.target.value)}
-            className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
+            placeholder="Leave blank to use Song Idea prompt directly..."
+            className="w-full rounded-md border border-studio-border bg-studio-bg px-2.5 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
           />
         </div>
 
@@ -370,6 +398,15 @@ export const ProducerPanel: React.FC<ProducerPanelProps> = ({
             onChange={(e) => setStructuredLyrics(e.target.value)}
             className="w-full flex-1 rounded-md border border-studio-border bg-studio-bg p-2 font-mono text-[11px] leading-relaxed text-slate-200 focus:border-indigo-500 focus:outline-none"
           />
+          <div
+            className={`mt-1 text-[10px] leading-snug ${
+              lyricWordCount >= 140 && !durationInput.trim()
+                ? "text-amber-300"
+                : "text-slate-500"
+            }`}
+          >
+            ~{lyricWordCount} kelime — uzun sözlerde Auto 120s keserse Duration kutusuna 180–210 yazabilirsin.
+          </div>
         </div>
 
         <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">

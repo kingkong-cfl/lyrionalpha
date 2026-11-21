@@ -72,6 +72,7 @@ export interface ProducerSpecSchema {
   raw_prompt: string;
   style_tags: string[];
   structured_lyrics: string;
+  vocal_language?: string | null;
   seed: number | null;
   guidance_scale: number;
   inference_steps: number;

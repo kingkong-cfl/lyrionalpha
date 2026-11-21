@@ -70,6 +70,15 @@ def _unique_wav_rel(folder: str, stem_slug: str, rev: int) -> str:
     return f"{folder}/{stem_slug}_rev{rev}_{uuid.uuid4().hex[:6]}.wav"
 
 
+def resolve_effective_style_tags(style_tags: list[str], raw_prompt: str) -> list[str]:
+    """Use explicit style tags when non-empty, otherwise fall back to non-empty raw_prompt."""
+    cleaned = [t.strip() for t in style_tags if t and t.strip()]
+    if cleaned:
+        return cleaned
+    trimmed = raw_prompt.strip()
+    return [trimmed] if trimmed else []
+
+
 def sum_raw_stems(
     project_id: str,
     tracks: list[TrackSchema],
@@ -126,12 +135,14 @@ async def trigger_generate_song(project_id: str, req: GenerateSongRequest) -> Jo
 
     async def _run(on_progress: ProgressCallback) -> dict[str, Any]:
         on_progress(0.10, "Loading ACE-Step 1.5 (bfloat16) into VRAM...")
+        effective_tags = resolve_effective_style_tags(req.style_tags, req.raw_prompt)
         master_audio, sr = await generate_full_song(
             bpm=req.bpm,
             musical_key=req.musical_key,
             duration_sec=req.duration_sec,
-            style_tags=req.style_tags,
+            style_tags=effective_tags,
             structured_lyrics=req.structured_lyrics,
+            vocal_language=req.vocal_language,
             seed=req.seed,
             guidance_scale=req.guidance_scale,
             inference_steps=req.inference_steps,
@@ -205,8 +216,9 @@ async def trigger_generate_song(project_id: str, req: GenerateSongRequest) -> Jo
             proj.grid = grid
             proj.producer_spec = ProducerSpecSchema(
                 raw_prompt=req.raw_prompt,
-                style_tags=req.style_tags,
+                style_tags=effective_tags,
                 structured_lyrics=req.structured_lyrics,
+                vocal_language=req.vocal_language,
                 seed=req.seed,
                 guidance_scale=req.guidance_scale,
                 inference_steps=req.inference_steps,

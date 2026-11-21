@@ -82,6 +82,7 @@ class ProducerSpecSchema(BaseModel):
     raw_prompt: str = ""
     style_tags: list[str] = Field(default_factory=list)
     structured_lyrics: str = ""
+    vocal_language: Optional[str] = None
     seed: Optional[int] = None
     guidance_scale: float = 1.0
     inference_steps: int = 8
@@ -169,6 +170,7 @@ class GenerateSongRequest(BaseModel):
     raw_prompt: str = ""
     style_tags: list[str] = Field(default_factory=list)
     structured_lyrics: str = ""
+    vocal_language: Optional[str] = None
     bpm: Optional[float] = Field(default=None, gt=20.0, le=300.0)
     musical_key: Optional[str] = None
     duration_sec: Optional[float] = Field(default=None, ge=8.0, le=240.0)

@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -265,7 +266,7 @@ def _read_and_fit_stereo(
     audio_path: Path,
     target_sr: int,
     total_samples: int | None,
-    max_duration_sec: float = 180.0,
+    max_duration_sec: float = 240.0,
 ) -> np.ndarray:
     """Read an audio file as float32 stereo at `target_sr`, fitting or preserving natural length."""
     try:
@@ -310,6 +311,74 @@ def _build_acestep_prompt(
     return ", ".join(parts)
 
 
+_TURKISH_DIACRITICS = set("çğıİöüşÇĞIÖÜŞ")
+_TURKISH_INDICATOR_WORDS = frozenset(
+    {
+        "ve",
+        "bir",
+        "ben",
+        "sen",
+        "gibi",
+        "icin",
+        "ama",
+        "cok",
+        "yok",
+        "var",
+        "gece",
+        "kalp",
+        "ask",
+        "hayat",
+        "zaman",
+        "beni",
+        "seni",
+        "biz",
+        "kadar",
+        "neden",
+        "nasil",
+        "bu",
+        "o",
+        "ile",
+        "gibi",
+        "belki",
+        "simdi",
+    }
+)
+
+
+def resolve_vocal_language(vocal_language: str | None, lyrics: str) -> tuple[str, bool]:
+    """Return (vocal_language, use_cot_language) with automatic Turkish detection when Auto."""
+    explicit = (vocal_language or "").strip().lower()
+    if explicit in ("instrumental", "none"):
+        return "unknown", False
+    if explicit and explicit not in ("auto", "unknown"):
+        return explicit, False
+
+    raw_lyrics = lyrics or ""
+    if any(ch in _TURKISH_DIACRITICS for ch in raw_lyrics):
+        return "tr", False
+
+    words = set(re.findall(r"[a-z]+", raw_lyrics.lower()))
+    if len(words & _TURKISH_INDICATOR_WORDS) >= 2:
+        return "tr", False
+
+    return "unknown", True
+
+
+def resolve_model_inference_profile(
+    config_path: str,
+    inference_steps: int,
+    guidance_scale: float,
+    shift: float,
+) -> tuple[int, float, float]:
+    """Upgrade turbo-default args automatically when SFT or Base checkpoints are active."""
+    cfg = (config_path or "").lower()
+    if ("sft" in cfg or "base" in cfg) and inference_steps == 8 and abs(guidance_scale - 1.0) < 1e-6:
+        sft_steps = int(os.environ.get("ACESTEP_SFT_STEPS", "32"))
+        sft_guidance = float(os.environ.get("ACESTEP_SFT_GUIDANCE_SCALE", "7.0"))
+        return sft_steps, sft_guidance, float(shift)
+    return int(inference_steps), float(guidance_scale), float(shift)
+
+
 def _resolve_acestep_project_root() -> str:
     explicit = os.environ.get("ACESTEP_PROJECT_ROOT", "").strip()
     if explicit:
@@ -341,23 +410,26 @@ def _load_acestep_model() -> Any:
         )
 
         project_root = _resolve_acestep_project_root()
+        config_path = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo").strip() or "acestep-v15-turbo"
+        offload_to_cpu = os.environ.get("ACESTEP_OFFLOAD_TO_CPU", "false").lower() in ("1", "true", "yes")
         dit_handler = AceStepHandler()
         init_kwargs = _filter_kwargs(
             dit_handler.initialize_service,
             {
                 "project_root": project_root,
-                "config_path": os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo"),
+                "config_path": config_path,
                 "device": device,
+                "offload_to_cpu": offload_to_cpu,
             },
         )
         init_res = dit_handler.initialize_service(**init_kwargs)
         _check_acestep_init_result(init_res)
 
         llm_handler = None
+        lm_model_path = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-1.7B").strip()
         try:
             from acestep.llm_inference import LLMHandler  # type: ignore
 
-            lm_model_path = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-1.7B").strip()
             lm_backend = os.environ.get("ACESTEP_LM_BACKEND", "pt").strip() or "pt"
             checkpoint_dir = str(Path(project_root) / "checkpoints")
             candidate_llm = LLMHandler()
@@ -368,7 +440,7 @@ def _load_acestep_model() -> Any:
                     "lm_model_path": lm_model_path,
                     "backend": lm_backend,
                     "device": device,
-                    "offload_to_cpu": False,
+                    "offload_to_cpu": offload_to_cpu,
                 },
             )
             llm_res = candidate_llm.initialize(**llm_kwargs)
@@ -378,10 +450,23 @@ def _load_acestep_model() -> Any:
             logger.warning("ACE-Step 1.5 LLMHandler unavailable, continuing with DiT-only mode: %s", exc)
             llm_handler = None
 
+        lm_short = lm_model_path.removeprefix("acestep-5Hz-") or lm_model_path
+        display_name = f"{config_path} + {lm_short}" if llm_handler is not None else f"{config_path} + lm=OFF"
+        logger.info(
+            "Loaded ACE-Step 1.5 (%s, device=%s, offload_to_cpu=%s)",
+            display_name,
+            device,
+            offload_to_cpu,
+        )
+
         return {
             "version": "1.5",
             "dit_handler": dit_handler,
             "llm_handler": llm_handler,
+            "config_path": config_path,
+            "lm_model_path": lm_model_path,
+            "offload_to_cpu": offload_to_cpu,
+            "display_name": display_name,
             "generate_music": generate_music,
             "GenerationParams": GenerationParams,
             "GenerationConfig": GenerationConfig,
@@ -414,6 +499,7 @@ def _invoke_acestep_real_sync(
     target_sr: int,
     total_samples: int | None,
     shift: float = 3.0,
+    vocal_language: str | None = None,
     src_audio: np.ndarray | None = None,
     repaint_start_sec: float = 0.0,
     repaint_end_sec: float = 0.0,
@@ -437,9 +523,20 @@ def _invoke_acestep_real_sync(
             gen_fn = pipe_bundle["generate_music"]
             dit_handler = pipe_bundle["dit_handler"]
             llm_handler = pipe_bundle.get("llm_handler")
+            config_path = str(
+                pipe_bundle.get("config_path") or os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
+            )
+            display_name = str(pipe_bundle.get("display_name") or config_path)
             use_thinking = bool(llm_handler is not None and task_type == "text2music")
 
+            eff_steps, eff_guidance, eff_shift = resolve_model_inference_profile(
+                config_path, inference_steps, guidance_scale, shift
+            )
+            resolved_lang, use_cot_lang = resolve_vocal_language(vocal_language, lyrics)
+            lm_cfg_scale = float(os.environ.get("ACESTEP_LM_CFG_SCALE", "2.0"))
+
             clean_key = (musical_key or "").strip()
+            target_dur = float(duration_sec) if duration_sec is not None else -1.0
             param_kwargs: dict[str, Any] = {
                 "task_type": task_type,
                 "caption": prompt,
@@ -447,11 +544,17 @@ def _invoke_acestep_real_sync(
                 "lyrics": lyrics,
                 "bpm": int(round(bpm)) if bpm is not None else None,
                 "keyscale": clean_key,
-                "duration": float(duration_sec) if duration_sec is not None else -1.0,
-                "inference_steps": int(inference_steps),
-                "guidance_scale": float(guidance_scale),
-                "shift": float(shift),
+                "duration": target_dur,
+                "vocal_language": resolved_lang,
+                "inference_steps": eff_steps,
+                "guidance_scale": eff_guidance,
+                "shift": eff_shift,
                 "thinking": use_thinking,
+                "use_cot_metas": use_thinking,
+                "use_cot_caption": use_thinking,
+                "use_cot_language": bool(use_thinking and use_cot_lang),
+                "use_constrained_decoding": use_thinking,
+                "lm_cfg_scale": lm_cfg_scale,
             }
             if seed is not None:
                 param_kwargs["seed"] = int(seed)
@@ -459,6 +562,22 @@ def _invoke_acestep_real_sync(
                 param_kwargs["src_audio"] = str(src_path)
                 param_kwargs["repainting_start"] = float(repaint_start_sec)
                 param_kwargs["repainting_end"] = float(repaint_end_sec)
+
+            logger.info(
+                "ACE-Step 1.5 [%s] task=%s lang=%s (cot_lang=%s) dur=%s bpm=%s key=%s steps=%s cfg=%s shift=%s thinking=%s lm_cfg=%s",
+                display_name,
+                task_type,
+                resolved_lang,
+                bool(use_thinking and use_cot_lang),
+                target_dur,
+                param_kwargs["bpm"],
+                clean_key or "Auto",
+                eff_steps,
+                eff_guidance,
+                eff_shift,
+                use_thinking,
+                lm_cfg_scale,
+            )
 
             params = params_cls(**_filter_kwargs(params_cls, param_kwargs))
             config = config_cls(
@@ -488,11 +607,14 @@ def _invoke_acestep_real_sync(
                 raise RuntimeError(f"ACE-Step 1.5 inference failed: {getattr(result, 'error', 'unknown error')}")
 
             out_file: Path | None = None
+            cot_meta: Any = getattr(result, "extra_outputs", None) or getattr(result, "metas", None)
             audios = getattr(result, "audios", None)
             if isinstance(audios, (list, tuple)) and len(audios) > 0:
                 first = audios[0]
                 if isinstance(first, dict) and first.get("path"):
                     out_file = Path(str(first["path"]))
+                    if cot_meta is None and "params" in first:
+                        cot_meta = first["params"]
                 elif hasattr(first, "path") and getattr(first, "path"):
                     out_file = Path(str(getattr(first, "path")))
                 elif isinstance(first, (str, Path)):
@@ -508,7 +630,15 @@ def _invoke_acestep_real_sync(
                     raise FileNotFoundError("ACE-Step 1.5 inference produced no output audio file.")
                 out_file = candidates[0]
 
-            return _read_and_fit_stereo(out_file, target_sr, total_samples)
+            stereo_out = _read_and_fit_stereo(out_file, target_sr, total_samples)
+            logger.info(
+                "ACE-Step 1.5 output ready: %.2fs (%d samples @ %d Hz), cot_meta=%s",
+                stereo_out.shape[0] / float(target_sr),
+                stereo_out.shape[0],
+                target_sr,
+                cot_meta,
+            )
+            return stereo_out
 
         pipe = pipe_bundle["pipeline"] if isinstance(pipe_bundle, dict) and "pipeline" in pipe_bundle else pipe_bundle
         out_path = Path(tmpdir) / "out.wav"
@@ -553,6 +683,7 @@ async def generate_full_song(
     duration_sec: float | None = None,
     style_tags: list[str],
     structured_lyrics: str,
+    vocal_language: str | None = None,
     seed: int | None = None,
     guidance_scale: float = 1.0,
     inference_steps: int = 8,
@@ -600,6 +731,7 @@ async def generate_full_song(
             target_sr=target_sr,
             total_samples=total_samples,
             shift=shift,
+            vocal_language=vocal_language,
         )
         return stereo, target_sr
 

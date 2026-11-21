@@ -113,6 +113,7 @@ export function App() {
   const activeProjectIdRef = useRef<string | null>(null);
   const gridRef = useRef<BeatGridSchema | null>(null);
   const selectionRef = useRef<RegionSelection | null>(null);
+  const stemsAuditionSnapshotRef = useRef<Record<string, { muted: boolean; soloed: boolean }> | null>(null);
 
   latestTracksRef.current = activeProject?.tracks ?? [];
   activeProjectIdRef.current = activeProject?.project_id ?? null;
@@ -308,6 +309,7 @@ export function App() {
   const handleUpdateServerUrl = (nextUrl: string) => {
     const cleaned = setSavedServerUrl(nextUrl);
     if (cleaned !== serverUrl) {
+      stemsAuditionSnapshotRef.current = null;
       audioEngine.disposeAll();
       setIsPlaying(false);
       updatePlayheadPosition(0, true);
@@ -326,6 +328,7 @@ export function App() {
 
   const handleSelectProject = async (projectId: string) => {
     if (!projectId) return;
+    stemsAuditionSnapshotRef.current = null;
     audioEngine.stop();
     setIsPlaying(false);
     updatePlayheadPosition(0, true);
@@ -342,6 +345,7 @@ export function App() {
   const handleCreateProject = async (name: string) => {
     try {
       const created = await createProject(serverUrl, name);
+      stemsAuditionSnapshotRef.current = null;
       setProjects((prev) => [created, ...prev]);
       setActiveProject(created);
       handleSelectRegion(null);
@@ -379,6 +383,7 @@ export function App() {
     raw_prompt: string;
     style_tags: string[];
     structured_lyrics: string;
+    vocal_language?: string | null;
     bpm: number | null;
     musical_key: string | null;
     duration_sec: number | null;
@@ -386,6 +391,7 @@ export function App() {
     separate_stems: boolean;
   }) => {
     try {
+      stemsAuditionSnapshotRef.current = null;
       audioEngine.stop();
       setIsPlaying(false);
       const target = await ensureActiveProject();
@@ -551,6 +557,49 @@ export function App() {
     setDspTrackId((prev) => (prev === id ? null : id));
   }, []);
 
+  const handleSetAuditionMode = useCallback((mode: "original" | "stems") => {
+    setActiveProject((prev) => {
+      if (!prev) return prev;
+      const fullMix = prev.tracks.find((t) => t.stem_role === "full_mix");
+      const stems = prev.tracks.filter((t) => t.stem_role !== "full_mix");
+      if (!fullMix || stems.length === 0) return prev;
+
+      if (mode === "original") {
+        const alreadyOriginal = !fullMix.muted && stems.every((s) => s.muted);
+        if (!alreadyOriginal) {
+          const snapshot: Record<string, { muted: boolean; soloed: boolean }> = {};
+          for (const st of stems) {
+            snapshot[st.track_id] = { muted: st.muted, soloed: st.soloed };
+          }
+          stemsAuditionSnapshotRef.current = snapshot;
+        }
+        const nextTracks = prev.tracks.map((t) =>
+          t.stem_role === "full_mix"
+            ? { ...t, muted: false, soloed: false }
+            : { ...t, muted: true, soloed: false }
+        );
+        audioEngine.syncMixerParams(nextTracks);
+        return { ...prev, tracks: nextTracks };
+      }
+
+      const snapshot = stemsAuditionSnapshotRef.current;
+      stemsAuditionSnapshotRef.current = null;
+      const nextTracks = prev.tracks.map((t) => {
+        if (t.stem_role === "full_mix") {
+          return { ...t, muted: true, soloed: false };
+        }
+        const savedState = snapshot?.[t.track_id];
+        return {
+          ...t,
+          muted: savedState ? savedState.muted : false,
+          soloed: savedState ? savedState.soloed : false,
+        };
+      });
+      audioEngine.syncMixerParams(nextTracks);
+      return { ...prev, tracks: nextTracks };
+    });
+  }, []);
+
   const handleExportTrack = useCallback((id: string) => {
     handleExportRef.current("single_track_wav", id);
   }, []);
@@ -614,6 +663,12 @@ export function App() {
 
   const busy = Boolean(activeJob && (activeJob.status === "queued" || activeJob.status === "running"));
   const dspTrack = activeProject?.tracks.find((t) => t.track_id === dspTrackId) ?? null;
+  const fullMixTrack = activeProject?.tracks.find((t) => t.stem_role === "full_mix") ?? null;
+  const stemTracks = activeProject?.tracks.filter((t) => t.stem_role !== "full_mix") ?? [];
+  const hasAbMixToggle = Boolean(fullMixTrack && stemTracks.length > 0);
+  const isOriginalMixAudition = Boolean(
+    fullMixTrack && stemTracks.length > 0 && !fullMixTrack.muted && stemTracks.every((t) => t.muted)
+  );
   const grid = activeProject?.grid ?? {
     sample_rate: 44100,
     total_samples: 0,
@@ -742,6 +797,35 @@ export function App() {
                   </span>
                 </div>
                 <div className="flex items-center gap-3">
+                  {hasAbMixToggle && (
+                    <div
+                      className="flex items-center rounded-md border border-studio-border bg-studio-bg p-0.5 text-[10px]"
+                      title="Compare lossless raw AI Mix directly vs 4-stem Demucs split"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => handleSetAuditionMode("original")}
+                        className={`rounded px-2 py-0.5 font-medium transition ${
+                          isOriginalMixAudition
+                            ? "bg-amber-500/25 text-amber-300"
+                            : "text-slate-400 hover:text-slate-200"
+                        }`}
+                      >
+                        Original AI Mix
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleSetAuditionMode("stems")}
+                        className={`rounded px-2 py-0.5 font-medium transition ${
+                          !isOriginalMixAudition
+                            ? "bg-indigo-600 text-white"
+                            : "text-slate-400 hover:text-slate-200"
+                        }`}
+                      >
+                        Stems Mix
+                      </button>
+                    </div>
+                  )}
                   <span className="font-mono text-[10px] text-cyan-300/90">
                     {loadingAudio
                       ? `Preloading Web Audio buffers (${audioLoadProgress ? `${audioLoadProgress.loaded}/${audioLoadProgress.total}` : "..."})...`

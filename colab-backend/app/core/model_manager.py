@@ -155,7 +155,18 @@ class ModelManager:
             if hasattr(torch.cuda, "ipc_collect"):
                 torch.cuda.ipc_collect()
 
+    def _active_model_label(self) -> str:
+        if self._active_type == ModelType.NONE:
+            return ModelType.NONE.value
+        if isinstance(self._active_model, dict) and self._active_model.get("display_name"):
+            return str(self._active_model["display_name"])
+        custom_label = getattr(self._active_model, "_lyrion_display_name", "")
+        if custom_label:
+            return str(custom_label)
+        return self._active_type.value
+
     def get_telemetry(self) -> GpuTelemetry:
+        label = self._active_model_label()
         if not settings.mock_gpu and torch is not None and torch.cuda.is_available():
             device_idx = torch.cuda.current_device()
             props = torch.cuda.get_device_properties(device_idx)
@@ -166,7 +177,7 @@ class ModelManager:
                 gpu_name=props.name,
                 vram_used_mb=used_mb,
                 vram_total_mb=total_mb,
-                active_model=self._active_type.value,
+                active_model=label,
                 mock_gpu=False,
             )
 
@@ -174,7 +185,7 @@ class ModelManager:
             gpu_name="NVIDIA L4 (Mocked Local)" if settings.mock_gpu else "CPU Fallback",
             vram_used_mb=_SIMULATED_VRAM_MB.get(self._active_type, 420.0),
             vram_total_mb=24576.0,
-            active_model=self._active_type.value,
+            active_model=label,
             mock_gpu=settings.mock_gpu,
         )
 

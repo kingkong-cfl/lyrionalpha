@@ -158,6 +158,7 @@ export async function triggerGenerateSong(
     raw_prompt: string;
     style_tags: string[];
     structured_lyrics: string;
+    vocal_language?: string | null;
     bpm: number | null;
     musical_key: string | null;
     duration_sec: number | null;

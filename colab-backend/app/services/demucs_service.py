@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -26,9 +27,22 @@ def _load_demucs_model() -> Any:
     from demucs.pretrained import get_model  # type: ignore
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = get_model("htdemucs")
+    preferred_model = os.environ.get("DEMUCS_MODEL", "htdemucs_ft").strip() or "htdemucs_ft"
+    loaded_name = preferred_model
+    try:
+        model = get_model(preferred_model)
+    except Exception as exc:
+        if preferred_model == "htdemucs":
+            raise
+        logger.warning("Failed to load Demucs '%s' (%s); falling back to 'htdemucs'.", preferred_model, exc)
+        loaded_name = "htdemucs"
+        model = get_model("htdemucs")
     model.to(device)
     model.eval()
+    try:
+        setattr(model, "_lyrion_display_name", loaded_name)
+    except Exception:
+        pass
     return model
 
 

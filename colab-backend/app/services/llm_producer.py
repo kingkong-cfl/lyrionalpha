@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.request
@@ -16,29 +17,30 @@ from app.schemas import EnhanceMode, ProducerEnhanceResponse
 logger = logging.getLogger("lyrion.llm_producer")
 
 SYSTEM_PROMPT = """You are an expert music producer and songwriter for ACE-Step 1.5.
-Convert the user's raw musical idea into a valid JSON object with ONLY these keys:
+Even if the user writes casual conversational Turkish or non-English requests (e.g. "kral biraz kırık erkek vokal, 2000ler indie rock, nakaratta patlasın"), understand their full musical intent and output a valid JSON object with ONLY these keys:
 {
   "bpm": <number between 60 and 180>,
   "musical_key": "<e.g. A minor, C major, F# minor>",
   "time_signature": "4/4",
   "duration_sec": <number between 16 and 180>,
-  "style_tags": ["<genre>", "<mood>", "<instrumentation>", "<vocal style>", "<tempo feel>"],
-  "structured_lyrics": "<formatted lyrics with [Intro], [Verse 1], [Chorus], [Bridge], [Outro] tags>"
+  "style_tags": ["<concrete English genre/era/instrument/vocal/mix tags understood best by ACE-Step 1.5>"],
+  "structured_lyrics": "<formatted lyrics in the user's language (Turkish if requested in Turkish) with balanced 6-11 syllables per line and blank-line separated [Verse 1], [Chorus], [Bridge], [Outro] headers>"
 }
-Return strict JSON without markdown fences."""
+Rules: ALWAYS output concrete English production/instrument/vocal/mix descriptors for style_tags; preserve user language and rhythmic syllable balance for structured_lyrics. Return strict JSON without markdown fences."""
 
 SYSTEM_PROMPT_TAGS = """You are an expert music producer for ACE-Step 1.5.
-Based on the user's musical idea and any provided existing lyrics, propose ONLY rich, accurate musical style tags.
+Even if the user writes casual conversational Turkish (e.g. "kral biraz kırık erkek vokal, 2000ler indie rock, nakaratta patlasın"), translate their stylistic, vocal, and instrumental intent into rich, concrete ENGLISH production, genre, era, instrument, vocal-character, and mix style_tags that ACE-Step 1.5 understands best.
 Return strict JSON without markdown fences:
 {
-  "style_tags": ["<genre>", "<subgenre/era>", "<mood>", "<lead instrumentation>", "<bass/drums texture>", "<vocal character>", "<mix feel>"]
+  "style_tags": ["<English genre>", "<era/subgenre>", "<mood>", "<lead instrumentation>", "<bass/drums texture>", "<vocal character>", "<mix feel>"]
 }"""
 
 SYSTEM_PROMPT_LYRICS = """You are an expert songwriter for ACE-Step 1.5.
-Based on the user's musical idea, optional style tags, and optional existing draft lyrics, write or refine singable structured lyrics using [Verse 1], [Chorus], [Verse 2], [Bridge] headers.
+Based on the user's musical idea, optional style tags, and optional existing draft lyrics, write or refine singable structured lyrics using [Verse 1], [Chorus], [Verse 2], [Bridge] headers separated by blank lines.
+Keep the lyrics in the user's language (e.g. write natural, poetic Turkish if the prompt or draft is in Turkish) and maintain consistent syllable counts (6-11 syllables per line across paired lines) for crisp vocal beat-alignment in ACE-Step 1.5.
 Return strict JSON without markdown fences:
 {
-  "structured_lyrics": "<formatted lyrics with section headers>"
+  "structured_lyrics": "<formatted lyrics with blank-line separated section headers>"
 }"""
 
 
@@ -80,7 +82,7 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
     return json.loads(cleaned)
 
 
-def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float = 6.0) -> dict[str, Any]:
+def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: float = 25.0) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -103,15 +105,37 @@ def _call_gemini(
         raw_prompt, preferred_duration, mode, existing_style_tags, existing_lyrics
     )
 
-    payload = {
+    gen_cfg: dict[str, Any] = {
+        "temperature": 0.7,
+        "responseMimeType": "application/json",
+    }
+    if os.environ.get("GEMINI_DISABLE_THINKING", "true").lower() not in ("0", "false", "no"):
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+
+    payload: dict[str, Any] = {
         "system_instruction": {"parts": [{"text": _system_prompt_for_mode(mode)}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-        "generationConfig": {
-            "temperature": 0.7,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": gen_cfg,
     }
-    data = _http_post_json(url, payload, {"Content-Type": "application/json"})
+    try:
+        data = _http_post_json(url, payload, {"Content-Type": "application/json"})
+    except urllib.error.HTTPError as err:
+        err_body = ""
+        try:
+            err_body = err.read().decode("utf-8", errors="ignore")
+        finally:
+            err.close()
+        if err.code == 400 and "thinkingConfig" in gen_cfg:
+            logger.warning(
+                "Gemini '%s' rejected thinkingConfig (HTTP 400: %s); retrying without thinkingConfig...",
+                model_name,
+                err_body[:240],
+            )
+            gen_cfg.pop("thinkingConfig", None)
+            data = _http_post_json(url, payload, {"Content-Type": "application/json"})
+        else:
+            raise RuntimeError(f"Gemini HTTP {err.code}: {err_body[:300] or err.reason}") from err
+
     text = data["candidates"][0]["content"]["parts"][0]["text"]
     parsed = _extract_json_object(text)
     return _normalize_response(

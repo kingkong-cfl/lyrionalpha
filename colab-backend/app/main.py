@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -13,6 +14,12 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.core.job_queue import job_queue
 from app.routers import generation, health, jobs, producer, projects
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
 
 def is_request_authorized(
